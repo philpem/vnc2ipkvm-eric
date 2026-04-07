@@ -35,7 +35,25 @@ Usage examples with curl:
 import asyncio
 import json
 import logging
+import os
 from urllib.parse import unquote
+
+from vnc2ipkvm.websocket_proxy import WebSocketProxy
+
+# Directory containing bundled noVNC files
+_NOVNC_DIR = os.path.join(os.path.dirname(__file__), "novnc")
+
+# MIME types for static file serving
+_MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".txt": "text/plain",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".ico": "image/x-icon",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -73,20 +91,25 @@ VIDEO_ACTIONS = {
 class ControlAPI:
     """Lightweight HTTP API server for KVM control commands."""
 
-    def __init__(self, bridge, listen_host: str = "127.0.0.1", listen_port: int = 6900):
+    def __init__(self, bridge, listen_host: str = "127.0.0.1", listen_port: int = 6900,
+                 vnc_host: str = "127.0.0.1", vnc_port: int = 5900):
         self.bridge = bridge
         self.listen_host = listen_host
         self.listen_port = listen_port
+        self.ws_port = listen_port + 1 if listen_port > 0 else 0
         self._server: asyncio.Server | None = None
         self._sse_clients: set[asyncio.StreamWriter] = set()
+        self._ws_proxy = WebSocketProxy(vnc_host, vnc_port)
 
     async def start(self):
         self._server = await asyncio.start_server(
             self._handle_connection, self.listen_host, self.listen_port)
         addr = self._server.sockets[0].getsockname()
         logger.info("Control API listening on http://%s:%d/", addr[0], addr[1])
+        await self._ws_proxy.start(self.listen_host, self.ws_port)
 
     async def stop(self):
+        await self._ws_proxy.stop()
         # Close all SSE clients
         for writer in list(self._sse_clients):
             try:
@@ -176,25 +199,24 @@ class ControlAPI:
             method = parts[0].upper()
             path = unquote(parts[1])
 
-            # SSE endpoint — hand off before reading body
-            if path.rstrip("/") == "/events" and method == "GET":
-                # Consume remaining headers
-                while True:
-                    line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                    if line in (b"\r\n", b"\n", b""):
-                        break
-                await self._handle_sse(reader, writer)
-                return
-
-            # Read headers
+            # Read all headers
+            headers = {}
             content_length = 0
             while True:
                 line = await asyncio.wait_for(reader.readline(), timeout=5.0)
                 if line in (b"\r\n", b"\n", b""):
                     break
-                header = line.decode("utf-8", errors="replace").strip().lower()
-                if header.startswith("content-length:"):
-                    content_length = int(header.split(":", 1)[1].strip())
+                header = line.decode("utf-8", errors="replace").strip()
+                if ":" in header:
+                    key, val = header.split(":", 1)
+                    headers[key.strip().lower()] = val.strip()
+                    if key.strip().lower() == "content-length":
+                        content_length = int(val.strip())
+
+            # SSE endpoint
+            if path.rstrip("/") == "/events" and method == "GET":
+                await self._handle_sse(reader, writer)
+                return
 
             # Read body if present
             body = b""
@@ -261,6 +283,14 @@ class ControlAPI:
         if not segments:
             return (200, _WEB_UI_HTML, "text/html; charset=utf-8")
 
+        # GET /vnc — redirect to noVNC viewer
+        if segments == ["vnc"]:
+            return self._serve_novnc_viewer()
+
+        # GET /novnc/... — serve noVNC static files
+        if segments[0] == "novnc":
+            return self._serve_static(segments[1:])
+
         # GET /status
         if segments == ["status"]:
             return self._get_status()
@@ -325,6 +355,34 @@ class ControlAPI:
         return (404, {"error": f"unknown endpoint: {path}",
                       "hint": "try GET /help"})
 
+    def _serve_novnc_viewer(self) -> tuple[int, str, str]:
+        """Redirect to the noVNC viewer page (served under /novnc/ so
+        relative ES module imports like ./core/rfb.js resolve correctly)."""
+        html = ('<!DOCTYPE html><html><head>'
+                '<meta http-equiv="refresh" content="0;url=/novnc/vnc_lite.html">'
+                '</head></html>')
+        return (200, html, "text/html; charset=utf-8")
+
+    def _serve_static(self, path_segments: list[str]) -> tuple:
+        """Serve a static file from the noVNC directory."""
+        if not path_segments:
+            return (404, {"error": "not found"})
+        # Sanitise: reject path traversal attempts
+        rel_path = "/".join(path_segments)
+        if ".." in rel_path:
+            return (400, {"error": "invalid path"})
+        filepath = os.path.join(_NOVNC_DIR, rel_path)
+        if not os.path.isfile(filepath):
+            return (404, {"error": f"not found: {rel_path}"})
+        ext = os.path.splitext(filepath)[1].lower()
+        content_type = _MIME_TYPES.get(ext, "application/octet-stream")
+        try:
+            with open(filepath, "rb") as f:
+                data = f.read()
+            return (200, data, content_type)
+        except OSError:
+            return (500, {"error": "read error"})
+
     def _get_status(self) -> tuple[int, dict]:
         kvm = self.bridge.kvm
         vs = kvm.video_settings
@@ -367,6 +425,8 @@ class ControlAPI:
             "endpoints": {
                 "GET /status": "Current KVM status and video settings",
                 "GET /events": "Server-Sent Events stream of status updates",
+                "GET /vnc": "Embedded noVNC viewer (browser-based VNC client)",
+                "ws://<host>:<port+1>": "WebSocket-to-VNC proxy (used by noVNC, separate port)",
                 "GET /help": "This help message",
                 "POST /video/<setting>/<value>": f"Adjust video: {', '.join(VIDEO_SETTINGS.keys())}",
                 "POST /video/auto-adjust": "Auto-adjust video settings",
@@ -571,7 +631,7 @@ _WEB_UI_HTML = """\
   *, *::before, *::after { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, sans-serif; margin: 0;
          background: #1a1a2e; color: #e0e0e0; }
-  .container { max-width: 860px; margin: 0 auto; padding: 16px; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 16px; }
   h1 { margin: 0 0 4px; font-size: 1.4em; color: #fff; }
   h1 small { font-weight: normal; color: #888; font-size: 0.7em; }
   .status-bar { display: flex; gap: 16px; flex-wrap: wrap;
@@ -615,7 +675,7 @@ _WEB_UI_HTML = """\
     font-size: 0.85em; }
 
   .kvm-banner { background: #1e40af; color: #fff; text-align: center;
-                padding: 8px 12px; border-radius: 6px; margin-bottom: 12px;
+                padding: 8px 12px; border-radius: 6px; margin-top: 10px;
                 font-size: 0.9em; font-family: monospace; white-space: pre;
                 display: none; }
   .kvm-banner.visible { display: block; }
@@ -636,7 +696,9 @@ _WEB_UI_HTML = """\
 <body>
 <div class="container">
 
-<h1>vnc2ipkvm <small id="kvm-host"></small></h1>
+<h1>vnc2ipkvm <small id="kvm-host"></small>
+  <a href="/vnc" target="_blank" style="float:right;font-size:0.55em;color:#93c5fd;text-decoration:none" title="Open in new tab">&#x29c9; Pop-out</a>
+</h1>
 
 <div class="status-bar" id="status-bar">
   <span><span class="dot off" id="dot"></span> <span id="conn-status">Checking...</span></span>
@@ -646,7 +708,13 @@ _WEB_UI_HTML = """\
   <span>Port: <span id="kvm-port-display">—</span></span>
 </div>
 
-<div class="kvm-banner" id="kvm-banner"></div>
+<div class="card" id="vnc-card">
+  <h2>Remote Console
+    <button class="btn" id="vnc-toggle" onclick="toggleVnc()" style="float:right;font-size:0.75em">Hide</button>
+  </h2>
+  <iframe id="vnc-frame" src="/novnc/vnc_lite.html" style="width:100%;height:480px;border:1px solid #2a3a5e;border-radius:4px;background:#000"></iframe>
+  <div class="kvm-banner" id="kvm-banner"></div>
+</div>
 
 <div class="grid-2">
 
@@ -743,6 +811,18 @@ _WEB_UI_HTML = """\
 
 <script>
 const API = '';  // same origin
+
+function toggleVnc() {
+  const frame = document.getElementById('vnc-frame');
+  const btn = document.getElementById('vnc-toggle');
+  if (frame.style.display === 'none') {
+    frame.style.display = '';
+    btn.textContent = 'Hide';
+  } else {
+    frame.style.display = 'none';
+    btn.textContent = 'Show';
+  }
+}
 
 const SLIDERS_STD = [
   { name: 'brightness',      label: 'Brightness',      key: 'brightness',      min: 0, max: 127 },

@@ -58,7 +58,8 @@ class Bridge:
                              keyboard=self.kbd)
 
         # Control API (disabled if port is 0)
-        self.api = ControlAPI(self, api_host, api_port) if api_port else None
+        self.api = ControlAPI(self, api_host, api_port,
+                              vnc_host="127.0.0.1", vnc_port=vnc_port) if api_port else None
 
         # Wire up callbacks
         self._setup_callbacks()
@@ -209,7 +210,8 @@ class Bridge:
         """Connect to the KVM and start the protocol loop."""
         try:
             await self.kvm.connect()
-            self.vnc.server_name = self.kvm.server_name or "Belkin IP-KVM"
+            kvm_name = self.kvm.server_name or "Belkin IP-KVM"
+            self.vnc.server_name = f"{kvm_name} ({self.kvm_config.host})"
             self._kvm_task = asyncio.create_task(self.kvm.run())
             logger.info("KVM connected and running")
             self._notify_ui()
