@@ -110,13 +110,13 @@ class TestControlAPIRouting(unittest.TestCase):
     # --- POST /video/<setting>/<value> ---
 
     def test_video_brightness(self):
-        result = self._route("POST", "/video/brightness/128")
+        result = self._route("POST", "/video/brightness/64")
         self.assertEqual(result[0], 200)
         self.assertTrue(result[1]["ok"])
         self.assertEqual(result[1]["setting"], "brightness")
-        self.assertEqual(result[1]["value"], 128)
+        self.assertEqual(result[1]["value"], 64)
         self.bridge.kvm.send_video_settings_request.assert_awaited_once_with(1)
-        self.bridge.kvm.send_video_setting.assert_awaited_once_with(0, 128)
+        self.bridge.kvm.send_video_setting.assert_awaited_once_with(0, 64)
 
     def test_video_contrast(self):
         result = self._route("POST", "/video/contrast/200")
@@ -139,7 +139,7 @@ class TestControlAPIRouting(unittest.TestCase):
         self.assertIn("error", result[1])
 
     def test_video_out_of_range_high(self):
-        result = self._route("POST", "/video/brightness/256")
+        result = self._route("POST", "/video/brightness/128")
         self.assertEqual(result[0], 400)
 
     def test_video_clock_max_boundary(self):

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Video setting name -> (setting_id, min, max)
 VIDEO_SETTINGS = {
-    "brightness":      (0, 0, 255),
+    "brightness":      (0, 0, 127),   # Java advanced mode: 0-127
     "contrast":        (1, 0, 255),
     "contrast-red":    (1, 0, 255),
     "contrast-green":  (2, 0, 255),
@@ -279,6 +279,9 @@ class ControlAPI:
         # Check for action (no value needed)
         if name in VIDEO_ACTIONS:
             setting_id, default_val = VIDEO_ACTIONS[name]
+            # Open the video settings dialog on the KVM side first
+            await kvm.send_video_settings_request(1)
+            await asyncio.sleep(0.1)
             await kvm.send_video_setting(setting_id, default_val)
             return (200, {"ok": True, "action": name})
 
@@ -476,7 +479,7 @@ _WEB_UI_HTML = """\
 const API = '';  // same origin
 
 const SLIDERS = [
-  { name: 'brightness',      label: 'Brightness',      key: 'brightness',      min: 0, max: 255 },
+  { name: 'brightness',      label: 'Brightness',      key: 'brightness',      min: 0, max: 127 },
   { name: 'contrast',        label: 'Contrast',         key: 'contrast',        min: 0, max: 255 },
   { name: 'contrast-green',  label: 'Contrast Green',   key: 'contrast_green',  min: 0, max: 255 },
   { name: 'contrast-blue',   label: 'Contrast Blue',    key: 'contrast_blue',   min: 0, max: 255 },

@@ -456,6 +456,9 @@ class ERICProtocol:
         # Request the initial full framebuffer update
         await self.send_fb_update_request(incremental=False)
 
+        # Request current video settings so the control API has values
+        await self.send_video_settings_request(1)
+
         while self._running:
             try:
                 # Use a timeout on read so we can send periodic keepalive
