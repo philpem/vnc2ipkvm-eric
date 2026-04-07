@@ -49,8 +49,14 @@ class Framebuffer:
             src_off = 0
             dst_off = (y * self.width + x) * bpp
             row_len = w * bpp
+            # Use memoryview for writes to prevent bytearray resizing
+            # (bytearray slice assignment can change length if RHS differs)
+            mv = memoryview(self.pixels)
             for row in range(h):
-                self.pixels[dst_off:dst_off + row_len] = data[src_off:src_off + row_len]
+                chunk = data[src_off:src_off + row_len]
+                if len(chunk) != row_len:
+                    break  # short data — stop rather than corrupt
+                mv[dst_off:dst_off + row_len] = chunk
                 src_off += row_len
                 dst_off += stride
             self._mark_dirty(x, y, w, h)
@@ -165,16 +171,6 @@ class Framebuffer:
             h = min(h, self.height - y)
             if w <= 0 or h <= 0:
                 return b""
-            expected = self.width * self.height * self.bytes_per_pixel
-            actual = len(self.pixels)
-            if actual != expected:
-                import logging
-                logging.getLogger(__name__).error(
-                    "Framebuffer size mismatch: %dx%d bpp=%d expects %d bytes, "
-                    "have %d bytes. Region: x=%d y=%d w=%d h=%d",
-                    self.width, self.height, self.bytes_per_pixel,
-                    expected, actual, x, y, w, h)
-                return b"\x00" * (w * h * 4)
             result = bytearray(w * h * 4)
             dst = 0
             if self.bytes_per_pixel == 1:

@@ -370,7 +370,7 @@ class ERICProtocol:
         if self.config.bpp == 16:
             msg = struct.pack(">BBBB BBBB HHH BBB BBB",
                               0, 0, 0, 0,           # type + padding
-                              16, 16, 0, 1,          # bpp=16, depth=16, big_endian=false, true_color=true
+                              16, 16, 1, 1,          # bpp=16, depth=16, big_endian=true, true_color=true
                               31, 63, 31,            # red/green/blue max (RGB565)
                               11, 5, 0,              # red/green/blue shift
                               0, 0, 0)               # padding
@@ -822,6 +822,8 @@ class ERICProtocol:
 
         # Check for 2-color palette mode
         palette_colors = None
+        palette_lut = []
+        use_gradient = False
         row_bytes = w * self.bytes_per_pixel  # default: bpp bytes per pixel
 
         if (sub_enc | 3) == 7:
@@ -863,6 +865,10 @@ class ERICProtocol:
                         palette_lut.append(await self._read_pixel())
                     # Each pixel is an index into the palette, 1 byte per pixel
                     row_bytes = w
+            elif filter_type == 2:
+                # Gradient filter: each byte is delta from predicted value.
+                # Data is same size as raw (w * bpp per row).
+                use_gradient = True
             elif filter_type != 0:
                 raise IOError(f"Unsupported tight filter type: {filter_type}")
         else:
@@ -883,16 +889,46 @@ class ERICProtocol:
             zlib_data = await self._read_exactly(zlib_len)
             pixel_data = self._inflate(stream_idx, zlib_data, data_len)
 
+        # Apply gradient filter: each byte = (delta + predicted) & 0xFF
+        # where predicted = left + above - above_left, clamped to [0, 255]
+        if use_gradient:
+            pixel_data = self._apply_gradient(pixel_data, w, h, row_bytes)
+
         # Decode into framebuffer
         if palette_colors is not None:
             # 2-color palette: 1 bit per pixel
             self._decode_tight_2color(x, y, w, h, pixel_data, palette_colors, row_bytes)
+        elif palette_lut:
+            # Multi-color palette: 1-byte indices into palette_lut
+            self._decode_tight_indexed(x, y, w, h, pixel_data, palette_lut, row_bytes)
         else:
             self._decode_tight_pixels(x, y, w, h, pixel_data, sub_enc, row_bytes)
 
     def _get_tight_palette(self, palette_type: int):
         palettes = {1: PALETTE_2, 2: PALETTE_4, 3: PALETTE_16_GRAY, 4: PALETTE_16_COLOR}
         return palettes.get(palette_type)
+
+    @staticmethod
+    def _apply_gradient(data: bytes, w: int, h: int, row_bytes: int) -> bytes:
+        """Apply tight gradient filter: reconstruct pixels from deltas.
+
+        Each byte is a delta: actual = (delta + predicted) & 0xFF
+        where predicted = clamp(left + above - above_left, 0, 255).
+        """
+        result = bytearray(len(data))
+        prev_row = bytearray(row_bytes)
+
+        for j in range(h):
+            src = j * row_bytes
+            for i in range(row_bytes):
+                left = result[src + i - 1] if i > 0 else 0
+                above = prev_row[i]
+                above_left = prev_row[i - 1] if i > 0 else 0
+                predicted = max(0, min(255, left + above - above_left))
+                result[src + i] = (data[src + i] + predicted) & 0xFF
+            prev_row[:] = result[src:src + row_bytes]
+
+        return bytes(result)
 
     def _convert_to_rgb332(self, data: bytes, num_pixels: int) -> bytes:
         """Convert pixel data from the server's native format to 8-bit RGB332.
@@ -972,6 +1008,19 @@ class ERICProtocol:
                     color = palette[(b >> bit) & 1]
                     self._put_pixel_row(row, px, self._argb_to_native(color))
                     px += 1
+            src += row_bytes
+            self.fb.put_raw(x, y + j, w, 1, bytes(row[:w * bpp]))
+
+    def _decode_tight_indexed(self, x, y, w, h, data, palette_lut, row_bytes):
+        """Decode multi-color palette data: 1-byte indices into palette_lut."""
+        bpp = self.fb.bytes_per_pixel
+        row = bytearray(w * bpp)
+        src = 0
+        n_colors = len(palette_lut)
+        for j in range(h):
+            for px in range(w):
+                idx = data[src + px] if (src + px) < len(data) else 0
+                self._put_pixel_row(row, px, palette_lut[idx % n_colors])
             src += row_bytes
             self.fb.put_raw(x, y + j, w, 1, bytes(row[:w * bpp]))
 
