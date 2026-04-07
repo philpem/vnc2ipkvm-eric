@@ -16,6 +16,7 @@ from vnc2ipkvm.vnc_server import (
     VNC_SET_PIXEL_FORMAT, VNC_SET_ENCODINGS,
     VNC_FB_UPDATE_REQUEST, VNC_KEY_EVENT,
     VNC_POINTER_EVENT, VNC_CLIENT_CUT_TEXT,
+    PSEUDO_DESKTOP_SIZE,
 )
 
 
@@ -230,7 +231,21 @@ class TestVNCMessageHandling(unittest.TestCase):
             data += struct.pack(">i", 1)  # CopyRect
             reader.feed_data(data)
             await handler._handle_set_encodings()
-            # Just verify it doesn't crash - encodings are logged only
+            self.assertFalse(handler._supports_desktop_size)
+
+        asyncio.get_event_loop().run_until_complete(_test())
+
+    def test_handle_set_encodings_with_desktop_size(self):
+        handler, reader, writer, _ = self._make_handler()
+
+        async def _test():
+            data = struct.pack(">xH", 3)  # 3 encodings
+            data += struct.pack(">i", 0)  # Raw
+            data += struct.pack(">i", PSEUDO_DESKTOP_SIZE)  # DesktopSize
+            data += struct.pack(">i", 1)  # CopyRect
+            reader.feed_data(data)
+            await handler._handle_set_encodings()
+            self.assertTrue(handler._supports_desktop_size)
 
         asyncio.get_event_loop().run_until_complete(_test())
 

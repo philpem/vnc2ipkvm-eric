@@ -4,6 +4,7 @@ Implements RFB protocol version 3.8 with:
   - No authentication (SecurityType None)
   - 32-bit BGRX pixel format (standard for most VNC clients)
   - Raw encoding for framebuffer updates
+  - DesktopSize pseudo-encoding (-223) for resolution changes
   - KeyEvent and PointerEvent forwarding
 """
 
@@ -24,6 +25,9 @@ VNC_FB_UPDATE_REQUEST = 3
 VNC_KEY_EVENT = 4
 VNC_POINTER_EVENT = 5
 VNC_CLIENT_CUT_TEXT = 6
+
+# Pseudo-encodings
+PSEUDO_DESKTOP_SIZE = -223  # 0xFFFFFF21
 
 
 class VNCServer:
@@ -119,6 +123,7 @@ class VNCClientHandler:
         self._pending_resize = False
         self._pending_clipboard: str | None = None
         self._modifier_tracker = ModifierTracker()
+        self._supports_desktop_size = False
 
         # Client pixel format (default 32-bit BGRX)
         self.bpp = 32
@@ -247,7 +252,9 @@ class VNCClientHandler:
         for i in range(num_encodings):
             enc = struct.unpack(">i", enc_data[i*4:i*4+4])[0]
             encodings.append(enc)
-        logger.debug("Client encodings: %s", encodings)
+        self._supports_desktop_size = PSEUDO_DESKTOP_SIZE in encodings
+        logger.debug("Client encodings: %s (DesktopSize=%s)",
+                     encodings, self._supports_desktop_size)
 
     async def _handle_fb_update_request(self):
         """Handle FramebufferUpdateRequest (type 3)."""
@@ -317,6 +324,24 @@ class VNCClientHandler:
                     msg = struct.pack(">BxxxI", 3, len(text_bytes)) + text_bytes
                     self.writer.write(msg)
                     await self.writer.drain()
+
+                if self._pending_resize:
+                    self._pending_resize = False
+                    if self._supports_desktop_size:
+                        # Send DesktopSize pseudo-encoding: a FramebufferUpdate
+                        # with one rectangle whose width/height are the new size
+                        w, h = self.fb.width, self.fb.height
+                        msg = struct.pack(">BxH", 0, 1)  # FBUpdate, 1 rect
+                        msg += struct.pack(">HHHHi", 0, 0, w, h,
+                                           PSEUDO_DESKTOP_SIZE)
+                        self.writer.write(msg)
+                        await self.writer.drain()
+                        logger.info("Sent DesktopSize %dx%d to client", w, h)
+                        # Still need a full update with the new content
+                    else:
+                        logger.warning("Client does not support DesktopSize — "
+                                       "disconnecting so it reconnects at new size")
+                        break
 
                 if self._full_update:
                     self._full_update = False
