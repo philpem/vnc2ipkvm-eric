@@ -210,6 +210,10 @@ class ControlAPI:
                 return await self._handle_type_string(body, kvm)
             return (400, {"error": "use /keyboard/release-all or /keyboard/type"})
 
+        # POST /hotkey/<index>
+        if segments[0] == "hotkey" and len(segments) >= 2:
+            return await self._handle_hotkey(segments[1], kvm)
+
         # POST /rdp/on — enter Remote Desktop mode
         if segments[0] == "rdp" and len(segments) >= 2 and segments[1] == "on":
             await kvm.send_mode_command(0)
@@ -260,6 +264,8 @@ class ControlAPI:
             "host_direct_mode": kvm.host_direct_mode,
             "connected_users": kvm.connected_users,
             "server_message": kvm.server_message,
+            "hotkeys": [{"label": h["label"], "confirm": h["confirm"]}
+                        for h in self.bridge.hotkeys],
         })
 
     def _help(self) -> tuple[int, dict]:
@@ -277,6 +283,7 @@ class ControlAPI:
                 "POST /exclusive/on|off": "Enable/disable exclusive access",
                 "POST /keyboard/release-all": "Release all held modifier keys",
                 "POST /keyboard/type": "Type a string (send in request body)",
+                "POST /hotkey/<n>": "Send hotkey n (from KVM configuration)",
                 "POST /rdp/on": "Enter Remote Desktop mode",
                 "POST /host-direct/on": "Enter Host Acceleration mode",
                 "POST /mode/exit": "Exit current mode (RDP or Host Direct)",
@@ -350,6 +357,50 @@ class ControlAPI:
 
         return (200, {"ok": True, "action": "type", "chars_typed": typed,
                       "chars_total": len(text)})
+
+    async def _handle_hotkey(self, index_str: str, kvm) -> tuple[int, dict]:
+        """Execute a hotkey by index — sends the scan code sequence."""
+        try:
+            index = int(index_str)
+        except ValueError:
+            return (400, {"error": "hotkey index must be an integer"})
+
+        hotkeys = self.bridge.hotkeys
+        if index < 0 or index >= len(hotkeys):
+            return (400, {"error": f"hotkey index {index} out of range (0-{len(hotkeys)-1})"})
+
+        hotkey = hotkeys[index]
+        codes = hotkey["codes"].split()
+        pressed = []  # stack of pressed keys
+
+        for hex_code in codes:
+            code = int(hex_code, 16)
+            if code == 0xF0:
+                continue  # separator, skip
+            elif code == 0xF1:
+                # Release all held keys
+                for sc in reversed(pressed):
+                    await kvm.send_key_event(sc, False)
+                pressed.clear()
+            elif code == 0xF2:
+                # Pause
+                await asyncio.sleep(0.1)
+            elif code == 0xF3:
+                # Release one key
+                if pressed:
+                    await kvm.send_key_event(pressed.pop(), False)
+            else:
+                # Press key
+                pressed.append(code)
+                await kvm.send_key_event(code, True)
+                await asyncio.sleep(0.02)
+
+        # Release any remaining keys
+        for sc in reversed(pressed):
+            await kvm.send_key_event(sc, False)
+
+        return (200, {"ok": True, "action": "hotkey",
+                      "index": index, "label": hotkey["label"]})
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +547,7 @@ _WEB_UI_HTML = """\
 <!-- Keyboard -->
 <div class="card">
   <h2>Keyboard</h2>
+  <div id="hotkey-buttons" class="btn-row" style="margin-bottom:8px"></div>
   <div class="form-row">
     <label>Type text:</label>
     <input type="text" id="type-text" placeholder="Text to type on KVM...">
@@ -633,6 +685,9 @@ async function refreshStatus() {
     document.getElementById('vnc-clients').textContent =
       (s.vnc_clients || 0) + ' VNC client' + (s.vnc_clients !== 1 ? 's' : '');
 
+    // Build hotkey buttons once
+    if (s.hotkeys) buildHotkeys(s.hotkeys);
+
     // KVM status banner
     const banner = document.getElementById('kvm-banner');
     if (banner) {
@@ -673,6 +728,26 @@ async function refreshStatus() {
     document.getElementById('dot').className = 'dot off';
     document.getElementById('conn-status').textContent = 'API unreachable';
   }
+}
+
+function sendHotkey(idx, label, needsConfirm) {
+  if (needsConfirm && !confirm("Send '" + label + "'?")) return;
+  postAction('/hotkey/' + idx);
+}
+
+let hotkeysBuilt = false;
+function buildHotkeys(hotkeys) {
+  if (hotkeysBuilt || !hotkeys || !hotkeys.length) return;
+  hotkeysBuilt = true;
+  const c = document.getElementById('hotkey-buttons');
+  hotkeys.forEach((h, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'btn primary';
+    btn.textContent = h.label;
+    btn.title = 'Send ' + h.label;
+    btn.onclick = () => sendHotkey(i, h.label, h.confirm);
+    c.appendChild(btn);
+  });
 }
 
 buildSliders();

@@ -34,12 +34,14 @@ class Bridge:
     def __init__(self, kvm_config: KVMConfig, vnc_host: str = "0.0.0.0",
                  vnc_port: int = 5900, auto_reconnect: bool = True,
                  keyboard_layout: str = "en_US",
-                 api_host: str = "127.0.0.1", api_port: int = 6900):
+                 api_host: str = "127.0.0.1", api_port: int = 6900,
+                 hotkeys: list | None = None):
         self.kvm_config = kvm_config
         self.vnc_host = vnc_host
         self.vnc_port = vnc_port
         self.auto_reconnect = auto_reconnect
         self.keyboard_layout = keyboard_layout
+        self.hotkeys = hotkeys or []
 
         # Initialize keyboard translator for the chosen layout
         self.kbd = get_translator(keyboard_layout)
@@ -371,11 +373,38 @@ def main():
                     pass
             print(f"  Session ID: {applet_id[:16]}...")
             print(f"  Protocol:   {protocol_version}")
+
+            # Extract hotkeys from applet params
+            hotkeys = []
+            i = 0
+            while True:
+                name = params.get(f"HOTKEY_{i}", "")
+                codes = params.get(f"HOTKEYCODE_{i}", "")
+                if not name and not codes:
+                    break
+                if name and codes:
+                    confirm = False
+                    label = name
+                    if label.lower().startswith("confirm "):
+                        confirm = True
+                        label = label[8:]
+                    hotkeys.append({
+                        "label": label.strip(),
+                        "codes": codes.strip(),
+                        "confirm": confirm,
+                    })
+                i += 1
+            if hotkeys:
+                print(f"  Hotkeys:   {', '.join(h['label'] for h in hotkeys)}")
+
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             print("Provide --applet-id manually, or --user/--password for login.",
                   file=sys.stderr)
             sys.exit(1)
+
+    if 'hotkeys' not in dir():
+        hotkeys = []  # manual --applet-id mode, no hotkeys from params
 
     encodings = [int(x.strip()) for x in args.encodings.split(",")]
 
@@ -403,6 +432,7 @@ def main():
         keyboard_layout=args.layout,
         api_host=args.api_host,
         api_port=args.api_port,
+        hotkeys=hotkeys,
     )
 
     print(f"VNC-to-IPKVM Bridge")
