@@ -47,7 +47,8 @@ class Bridge:
         self.kbd = get_translator(keyboard_layout)
 
         # Shared framebuffer
-        self.fb = Framebuffer(DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        self.fb = Framebuffer(DEFAULT_WIDTH, DEFAULT_HEIGHT,
+                              bytes_per_pixel=kvm_config.bpp // 8)
 
         # KVM client
         self.kvm = ERICProtocol(kvm_config, self.fb)
@@ -318,6 +319,10 @@ Examples:
     parser.add_argument("--api-port", type=int, default=6900,
                         help="Control API listen port (default: 6900, 0 to disable)")
 
+    parser.add_argument("--bpp", type=int, default=16, choices=[8, 16],
+                        help="Pixel depth: 16 = native RGB565 (default), "
+                             "8 = RGB332 with colour map")
+
     parser.add_argument("--no-reconnect", action="store_true",
                         help="Disable auto-reconnect to KVM")
     parser.add_argument("--norbox", default="no", choices=["no", "ipv4", "ipv6"],
@@ -464,6 +469,7 @@ def main():
         share_desktop=not args.no_share,
         use_ssl=use_ssl,
         encodings=encodings,
+        bpp=args.bpp,
         norbox=norbox,
         norbox_ipv4_target=norbox_target if norbox == "ipv4" else "",
         norbox_ipv6_target=norbox_target if norbox == "ipv6" else "",
@@ -487,6 +493,7 @@ def main():
     print(f"  Applet ID: {config.applet_id}")
     print(f"  Keyboard:  {args.layout}")
     print(f"  Encodings: {encodings}")
+    print(f"  Colour:    {args.bpp}-bit ({'RGB565' if args.bpp == 16 else 'RGB332'})")
     if args.api_port:
         print(f"  Control:   http://{args.api_host}:{args.api_port}/")
     print()

@@ -1,12 +1,14 @@
-"""Color conversion between 8-bit RGB332 and 32-bit RGBA/RGB888.
+"""Color conversion for RGB332 (8-bit) and RGB565 (16-bit) pixel formats.
 
-The Belkin IP-KVM uses an 8-bit color model with DirectColorModel(8, 7, 56, 192):
+The Belkin IP-KVM natively captures in 16-bit RGB565:
+  - Red:   bits 11-15, 5 bits, redMax=31, redShift=11
+  - Green: bits  5-10, 6 bits, greenMax=63, greenShift=5
+  - Blue:  bits  0-4,  5 bits, blueMax=31, blueShift=0
+
+When 8-bit mode is requested, the KVM quantises to RGB332:
   - Red:   bits 0-2 (mask 0x07), 3 bits, range 0-7
   - Green: bits 3-5 (mask 0x38), 3 bits, range 0-7
   - Blue:  bits 6-7 (mask 0xC0), 2 bits, range 0-3
-
-The SetPixelFormat message confirms: redMax=7, greenMax=7, blueMax=3,
-redShift=0, greenShift=3, blueShift=6.
 """
 
 import struct
@@ -53,6 +55,29 @@ PALETTE_16_COLOR = [
 for _pal in (PALETTE_2, PALETTE_4, PALETTE_16_GRAY, PALETTE_16_COLOR):
     for _i in range(len(_pal)):
         _pal[_i] = 0xFF000000 | _pal[_i]
+
+
+# Pre-computed lookup table: RGB565 (16-bit) -> (R8, G8, B8) tuple
+RGB565_TO_RGB = [(0, 0, 0)] * 65536
+
+def _init_rgb565_table():
+    for i in range(65536):
+        r5 = (i >> 11) & 0x1F
+        g6 = (i >> 5) & 0x3F
+        b5 = i & 0x1F
+        RGB565_TO_RGB[i] = ((r5 * 255 + 15) // 31,
+                            (g6 * 255 + 31) // 63,
+                            (b5 * 255 + 15) // 31)
+
+_init_rgb565_table()
+
+
+def argb_to_rgb565(argb: int) -> int:
+    """Convert 32-bit ARGB888 to 16-bit RGB565."""
+    r = (argb >> 16) & 0xFF
+    g = (argb >> 8) & 0xFF
+    b = argb & 0xFF
+    return ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
 
 
 def rgb332_to_rgb888_pixel(pixel: int) -> bytes:

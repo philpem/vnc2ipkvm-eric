@@ -394,29 +394,36 @@ class VNCClientHandler:
 
     def _convert_pixels_generic(self, x: int, y: int, w: int, h: int) -> bytes:
         """Generic pixel conversion for non-standard VNC pixel formats."""
+        from vnc2ipkvm.color import RGB565_TO_RGB
         result = bytearray(w * h * (self.bpp // 8))
-        stride = self.fb.width
         dst = 0
-        bytes_per_pixel = self.bpp // 8
+        out_bpp = self.bpp // 8
+        fb_bpp = self.fb.bytes_per_pixel
 
         with self.fb.lock:
             cmap = self.fb._colourmap
             for row in range(h):
-                src_off = (y + row) * stride + x
+                src_off = ((y + row) * self.fb.width + x) * fb_bpp
                 for col in range(w):
-                    r, g, b = cmap[self.fb.pixels[src_off + col]]
+                    if fb_bpp == 1:
+                        r, g, b = cmap[self.fb.pixels[src_off]]
+                        src_off += 1
+                    else:
+                        pixel16 = (self.fb.pixels[src_off] << 8) | self.fb.pixels[src_off + 1]
+                        r, g, b = RGB565_TO_RGB[pixel16]
+                        src_off += 2
                     pixel = ((r & self.red_max) << self.red_shift |
                              (g & self.green_max) << self.green_shift |
                              (b & self.blue_max) << self.blue_shift)
                     if self.big_endian:
-                        for i in range(bytes_per_pixel - 1, -1, -1):
+                        for i in range(out_bpp - 1, -1, -1):
                             result[dst + i] = pixel & 0xFF
                             pixel >>= 8
                     else:
-                        for i in range(bytes_per_pixel):
+                        for i in range(out_bpp):
                             result[dst + i] = pixel & 0xFF
                             pixel >>= 8
-                    dst += bytes_per_pixel
+                    dst += out_bpp
 
         return bytes(result)
 

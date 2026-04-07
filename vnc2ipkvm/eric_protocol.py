@@ -16,7 +16,8 @@ import struct
 import zlib
 from dataclasses import dataclass, field
 
-from vnc2ipkvm.color import RGB332_TO_ARGB, RGB332_TO_RGB, PALETTE_2, PALETTE_4, PALETTE_16_GRAY, PALETTE_16_COLOR
+from vnc2ipkvm.color import (RGB332_TO_ARGB, RGB332_TO_RGB, PALETTE_2, PALETTE_4,
+                              PALETTE_16_GRAY, PALETTE_16_COLOR, argb_to_rgb565)
 from vnc2ipkvm.framebuffer import Framebuffer
 from vnc2ipkvm.keyboard import keysym_to_scancode, make_key_event, PRESS_FLAG
 
@@ -76,6 +77,7 @@ class KVMConfig:
     share_desktop: bool = True
     use_ssl: bool = True
     encodings: list = field(default_factory=lambda: [255, 7, -250])
+    bpp: int = 16                    # 8 = RGB332 with colourmap, 16 = RGB565 native
     norbox: str = "no"              # "no", "ipv4", or "ipv6"
     norbox_ipv4_target: str = ""    # IPv4 target for NORBOX routing
     norbox_ipv6_target: str = ""    # IPv6 target for NORBOX routing
@@ -364,13 +366,21 @@ class ERICProtocol:
         await self._write(bytes([0x97, phase & 0xFF]))
 
     async def send_set_pixel_format(self):
-        """Send SetPixelFormat (type 0x00) with 8-bit RGB332 format."""
-        msg = struct.pack(">BBBB BBBB HHH BBB BBB",
-                          0, 0, 0, 0,           # type + padding
-                          8, 8, 0, 1,           # bpp=8, depth=8, big_endian=false, true_color=true
-                          7, 7, 3,              # red/green/blue max
-                          0, 3, 6,              # red/green/blue shift
-                          0, 0, 0)              # padding
+        """Send SetPixelFormat (type 0x00) requesting our desired pixel depth."""
+        if self.config.bpp == 16:
+            msg = struct.pack(">BBBB BBBB HHH BBB BBB",
+                              0, 0, 0, 0,           # type + padding
+                              16, 16, 0, 1,          # bpp=16, depth=16, big_endian=false, true_color=true
+                              31, 63, 31,            # red/green/blue max (RGB565)
+                              11, 5, 0,              # red/green/blue shift
+                              0, 0, 0)               # padding
+        else:
+            msg = struct.pack(">BBBB BBBB HHH BBB BBB",
+                              0, 0, 0, 0,           # type + padding
+                              8, 8, 0, 1,           # bpp=8, depth=8, big_endian=false, true_color=true
+                              7, 7, 3,              # red/green/blue max (RGB332)
+                              0, 3, 6,              # red/green/blue shift
+                              0, 0, 0)              # padding
         await self._write(msg)
 
     async def send_command(self, key: str, value: str):
@@ -459,14 +469,14 @@ class ERICProtocol:
         """Main protocol loop: send initial requests and process server messages."""
         self._running = True
 
-        # Send SetEncodings first, then SetPixelFormat for 8-bit RGB332.
+        # Send SetEncodings first, then SetPixelFormat.
         # Order matters: Java client (x.java a()) sends SetEncodings first,
         # then SetPixelFormat via ByteColorRFBRenderer.cfr_renamed_9().
         await self.send_set_encodings()
         await self.send_set_pixel_format()
-        # After requesting 8bpp, update our state to match
-        self.bpp = 8
-        self.bytes_per_pixel = 1
+        # Update our state to match the requested format
+        self.bpp = self.config.bpp
+        self.bytes_per_pixel = self.config.bpp // 8
 
         # Request the initial full framebuffer update
         await self.send_fb_update_request(incremental=False)
@@ -625,10 +635,11 @@ class ERICProtocol:
     async def _decode_raw(self, x: int, y: int, w: int, h: int):
         """Decode Raw encoding (type 0): w*h*bytes_per_pixel bytes of pixel data."""
         data = await self._read_exactly(w * h * self.bytes_per_pixel)
-        if self.bytes_per_pixel == 1:
+        if self.bytes_per_pixel == self.fb.bytes_per_pixel:
+            # Pixel format matches framebuffer — write directly
             self.fb.put_raw(x, y, w, h, data)
         else:
-            # Convert multi-byte pixels to 8-bit RGB332 for the framebuffer
+            # Server sends multi-byte but framebuffer is 8-bit — convert
             self.fb.put_raw(x, y, w, h, self._convert_to_rgb332(data, w * h))
 
     async def _decode_copyrect(self, x: int, y: int, w: int, h: int):
@@ -638,12 +649,15 @@ class ERICProtocol:
         self.fb.copy_rect(src_x, src_y, x, y, w, h)
 
     async def _read_pixel(self) -> int:
-        """Read one pixel in the server's native format and return RGB332."""
+        """Read one pixel in the current format (RGB332 or RGB565)."""
         if self.bytes_per_pixel == 1:
             return await self._read_byte()
         data = await self._read_exactly(self.bytes_per_pixel)
         if self.bytes_per_pixel == 2:
             pixel = (data[0] << 8) | data[1]
+            if self.config.bpp == 16:
+                return pixel  # raw RGB565
+            # 8-bit mode: convert RGB565 → RGB332
             r5 = (pixel >> 11) & 0x1F
             g6 = (pixel >> 5) & 0x3F
             b5 = pixel & 0x1F
@@ -675,7 +689,7 @@ class ERICProtocol:
                 if flags & 0x01:
                     # Raw tile
                     tile_data = await self._read_exactly(tw * th * bpp)
-                    if bpp == 1:
+                    if bpp == self.fb.bytes_per_pixel:
                         self.fb.put_raw(tx, ty, tw, th, tile_data)
                     else:
                         self.fb.put_raw(tx, ty, tw, th,
@@ -733,8 +747,9 @@ class ERICProtocol:
             return
 
         # Read all pixel data (in 16x16 tile order)
+        bpp = self.bytes_per_pixel
         n_pixels = w * h
-        packed = await self._read_exactly(n_pixels)
+        packed = await self._read_exactly(n_pixels * bpp)
 
         # Clip to framebuffer bounds
         cw = min(w, self.fb.width - x)
@@ -744,27 +759,24 @@ class ERICProtocol:
         # reading from the packed buffer which is organized in 16x16 blocks.
         # Blocks are laid out left-to-right, top-to-bottom, and within each
         # block pixels are stored column-major (all rows of col 0, then col 1...).
-        result = bytearray(cw * ch)
+        result = bytearray(cw * ch * bpp)
         tile_w = 16
         tile_h = 16
 
-        src_idx = 0
         dst_idx = 0
         blk_base = 0   # start of current block-row in source
         blk_row_count = 0  # row within current block-row
-        blk_col_idx = 0  # which block column we're reading from
 
         for row in range(ch):
             col_in_tile = 0
-            src_idx = blk_base + blk_row_count * tile_w
+            src_idx = (blk_base + blk_row_count * tile_w) * bpp
             for col in range(cw):
-                result[dst_idx] = packed[src_idx]
-                dst_idx += 1
-                src_idx += 1
+                result[dst_idx:dst_idx + bpp] = packed[src_idx:src_idx + bpp]
+                dst_idx += bpp
+                src_idx += bpp
                 col_in_tile += 1
                 if col_in_tile == tile_w:
-                    # Jump to next tile column: skip remaining rows in this tile
-                    src_idx += (tile_h - 1) * tile_w
+                    src_idx += (tile_h - 1) * tile_w * bpp
                     col_in_tile = 0
 
             blk_row_count += 1
@@ -786,9 +798,9 @@ class ERICProtocol:
 
         sub_enc = (control >> 4) & 0x0F
 
-        # Solid fill (always 1-byte RGB332 in tight 8-bit encoding)
+        # Solid fill
         if sub_enc == 0x08:
-            color = await self._read_byte()
+            color = await self._read_pixel()
             self.fb.fill_rect(x, y, w, h, color)
             return
 
@@ -801,7 +813,7 @@ class ERICProtocol:
                 color_val = palette[color_byte % len(palette)]
             else:
                 color_val = color_byte
-            self.fb.fill_rect(x, y, w, h, self._argb_to_rgb332(color_val))
+            self.fb.fill_rect(x, y, w, h, self._argb_to_native(color_val))
             return
 
         # Determine packed pixel width based on sub-encoding
@@ -810,7 +822,7 @@ class ERICProtocol:
 
         # Check for 2-color palette mode
         palette_colors = None
-        row_bytes = w  # default: 1 byte per pixel
+        row_bytes = w * self.bytes_per_pixel  # default: bpp bytes per pixel
 
         if (sub_enc | 3) == 7:
             # Has filter
@@ -915,6 +927,12 @@ class ERICProtocol:
         b = argb & 0xFF
         return ((r * 7 + 127) // 255) | (((g * 7 + 127) // 255) << 3) | (((b * 3 + 127) // 255) << 6)
 
+    def _argb_to_native(self, argb: int) -> int:
+        """Convert ARGB888 to the current pixel format (RGB332 or RGB565)."""
+        if self.config.bpp == 16:
+            return argb_to_rgb565(argb)
+        return self._argb_to_rgb332(argb)
+
     def _inflate(self, stream_idx: int, data: bytes, expected_len: int) -> bytes:
         """Decompress data using the specified zlib stream."""
         if self._inflaters[stream_idx] is None:
@@ -925,9 +943,20 @@ class ERICProtocol:
             result += self._inflaters[stream_idx].flush()
         return result[:expected_len]
 
+    def _put_pixel_row(self, row: bytearray, px: int, color: int):
+        """Write a native pixel value into a row buffer at pixel position px."""
+        bpp = self.fb.bytes_per_pixel
+        off = px * bpp
+        if bpp == 1:
+            row[off] = color & 0xFF
+        else:
+            row[off] = (color >> 8) & 0xFF
+            row[off + 1] = color & 0xFF
+
     def _decode_tight_2color(self, x, y, w, h, data, palette, row_bytes):
         """Decode 1-bit-per-pixel data with a 2-color palette."""
-        row = bytearray(w)
+        bpp = self.fb.bytes_per_pixel
+        row = bytearray(w * bpp)
         src = 0
         for j in range(h):
             px = 0
@@ -935,21 +964,21 @@ class ERICProtocol:
                 b = data[src + byte_idx]
                 for bit in range(7, -1, -1):
                     color = palette[(b >> bit) & 1]
-                    row[px] = self._argb_to_rgb332(color)
+                    self._put_pixel_row(row, px, self._argb_to_native(color))
                     px += 1
-            # Handle remaining pixels
             if w % 8:
                 b = data[src + w // 8]
                 for bit in range(7, 7 - (w % 8), -1):
                     color = palette[(b >> bit) & 1]
-                    row[px] = self._argb_to_rgb332(color)
+                    self._put_pixel_row(row, px, self._argb_to_native(color))
                     px += 1
             src += row_bytes
-            self.fb.put_raw(x, y + j, w, 1, bytes(row[:w]))
+            self.fb.put_raw(x, y + j, w, 1, bytes(row[:w * bpp]))
 
     def _decode_tight_pixels(self, x, y, w, h, data, sub_enc, row_bytes):
         """Decode tight pixel data into the framebuffer."""
-        row = bytearray(w)
+        bpp = self.fb.bytes_per_pixel
+        row = bytearray(w * bpp)
         src = 0
 
         for j in range(h):
@@ -960,13 +989,13 @@ class ERICProtocol:
                     b = data[src + byte_idx]
                     for bit in range(7, -1, -1):
                         idx = (b >> bit) & 1
-                        row[px] = self._argb_to_rgb332(PALETTE_2[idx])
+                        self._put_pixel_row(row, px, self._argb_to_native(PALETTE_2[idx]))
                         px += 1
                 if w % 8:
                     b = data[src + w // 8]
                     for bit in range(7, 7 - (w % 8), -1):
                         idx = (b >> bit) & 1
-                        row[px] = self._argb_to_rgb332(PALETTE_2[idx])
+                        self._put_pixel_row(row, px, self._argb_to_native(PALETTE_2[idx]))
                         px += 1
             elif sub_enc == 11:
                 # 2-bit: 4-color greyscale
@@ -975,14 +1004,14 @@ class ERICProtocol:
                     b = data[src + byte_idx]
                     for shift in (6, 4, 2, 0):
                         idx = (b >> shift) & 3
-                        row[px] = self._argb_to_rgb332(PALETTE_4[idx])
+                        self._put_pixel_row(row, px, self._argb_to_native(PALETTE_4[idx]))
                         px += 1
                 rem = w % 4
                 if rem:
                     b = data[src + w // 4]
                     for s in range(rem):
                         idx = (b >> (6 - 2 * s)) & 3
-                        row[px] = self._argb_to_rgb332(PALETTE_4[idx])
+                        self._put_pixel_row(row, px, self._argb_to_native(PALETTE_4[idx]))
                         px += 1
             elif sub_enc in (12, 13):
                 # 4-bit: 16-color
@@ -990,20 +1019,21 @@ class ERICProtocol:
                 px = 0
                 for byte_idx in range(w // 2):
                     b = data[src + byte_idx]
-                    row[px] = self._argb_to_rgb332(palette[(b >> 4) & 0xF])
+                    self._put_pixel_row(row, px, self._argb_to_native(palette[(b >> 4) & 0xF]))
                     px += 1
-                    row[px] = self._argb_to_rgb332(palette[b & 0xF])
+                    self._put_pixel_row(row, px, self._argb_to_native(palette[b & 0xF]))
                     px += 1
                 if w % 2:
                     b = data[src + w // 2]
-                    row[px] = self._argb_to_rgb332(palette[(b >> 4) & 0xF])
+                    self._put_pixel_row(row, px, self._argb_to_native(palette[(b >> 4) & 0xF]))
                     px += 1
             else:
-                # 8-bit: direct RGB332
-                row[:w] = data[src:src + w]
+                # Direct pixels: bpp bytes per pixel
+                row_len = w * bpp
+                row[:row_len] = data[src:src + row_len]
 
             src += row_bytes
-            self.fb.put_raw(x, y + j, w, 1, bytes(row[:w]))
+            self.fb.put_raw(x, y + j, w, 1, bytes(row[:w * bpp]))
 
     async def _decode_extended(self, x: int, y: int, w: int, h: int):
         """Decode Extended encoding (type 9).
@@ -1088,6 +1118,12 @@ class ERICProtocol:
 
         data = await self._read_exactly(body_len)
 
+        # In 16-bit mode, the server shouldn't send colourmap entries
+        # but we still read the data above to keep the stream aligned.
+        if self.config.bpp == 16:
+            logger.debug("Ignoring SetColourMapEntries in 16-bit mode")
+            return
+
         # Update the colour map with the new entries
         for i in range(num_colours):
             off = i * 6
@@ -1112,10 +1148,10 @@ class ERICProtocol:
         old_w, old_h = self.width, self.height
         await self._read_fb_params()
         # _read_fb_params reads the server's native pixel format (e.g. 16bpp)
-        # but we've already sent SetPixelFormat requesting 8bpp RGB332.
+        # but we've already sent SetPixelFormat requesting our desired format.
         # Override bpp back to what we requested.
-        self.bpp = 8
-        self.bytes_per_pixel = 1
+        self.bpp = self.config.bpp
+        self.bytes_per_pixel = self.config.bpp // 8
         logger.info("Desktop resized: %dx%d -> %dx%d", old_w, old_h, self.width, self.height)
         if self.on_resize:
             self.on_resize(self.width, self.height)
