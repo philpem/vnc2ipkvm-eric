@@ -434,6 +434,14 @@ class ERICProtocol:
         """Send auto-adjust video settings command."""
         await self.send_video_setting(12, 0)
 
+    async def send_refresh_video(self):
+        """Send video refresh command (type 0x92).
+
+        Forces the KVM to resend the entire screen. This is the
+        Java applet's "Refresh Video" menu item (ap.h()).
+        """
+        await self._write(bytes([0x92]))
+
     async def send_release_all_modifiers(self):
         """Release all held modifier keys on the KVM.
 

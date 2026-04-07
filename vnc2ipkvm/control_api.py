@@ -430,6 +430,7 @@ class ControlAPI:
                 "GET /help": "This help message",
                 "POST /video/<setting>/<value>": f"Adjust video: {', '.join(VIDEO_SETTINGS.keys())}",
                 "POST /video/auto-adjust": "Auto-adjust video settings",
+                "POST /video/refresh": "Force full screen refresh",
                 "POST /video/save": "Save current video settings",
                 "POST /video/undo": "Undo video setting changes",
                 "POST /video/reset-mode": "Reset current video mode to factory",
@@ -453,6 +454,11 @@ class ControlAPI:
                           "actions": list(VIDEO_ACTIONS.keys())})
 
         name = segments[0]
+
+        # Refresh video — dedicated command, not a video setting
+        if name == "refresh":
+            await kvm.send_refresh_video()
+            return (200, {"ok": True, "action": "refresh"})
 
         # Check for action (no value needed)
         if name in VIDEO_ACTIONS:
@@ -723,6 +729,7 @@ _WEB_UI_HTML = """\
   <h2>Video Settings <button class="btn" id="mode-toggle" onclick="toggleMode()" style="float:right;font-size:0.75em">Advanced</button></h2>
   <div id="video-sliders"></div>
   <div class="btn-row">
+    <button class="btn primary" onclick="postAction('/video/refresh')">Refresh</button>
     <button class="btn primary" onclick="postAction('/video/auto-adjust')">Auto Adjust</button>
     <button class="btn" onclick="postAction('/video/save')">Save</button>
     <button class="btn" onclick="postAction('/video/undo')">Undo</button>
