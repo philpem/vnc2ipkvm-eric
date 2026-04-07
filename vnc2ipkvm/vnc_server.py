@@ -80,7 +80,10 @@ class VNCServer:
             self._client_task = asyncio.current_task()
             await client.run()
         except (Exception, asyncio.CancelledError) as e:
-            if not isinstance(e, asyncio.CancelledError):
+            if not isinstance(e, (asyncio.CancelledError, ConnectionError,
+                                  asyncio.IncompleteReadError)):
+                logger.exception("VNC client %s:%d error", addr[0], addr[1])
+            else:
                 logger.info("VNC client %s:%d disconnected: %s", addr[0], addr[1], e)
         finally:
             if client in self._clients:
@@ -395,12 +398,16 @@ class VNCClientHandler:
     def _convert_pixels_generic(self, x: int, y: int, w: int, h: int) -> bytes:
         """Generic pixel conversion for non-standard VNC pixel formats."""
         from vnc2ipkvm.color import RGB565_TO_RGB
-        result = bytearray(w * h * (self.bpp // 8))
-        dst = 0
         out_bpp = self.bpp // 8
         fb_bpp = self.fb.bytes_per_pixel
 
         with self.fb.lock:
+            w = min(w, self.fb.width - x)
+            h = min(h, self.fb.height - y)
+            if w <= 0 or h <= 0:
+                return b""
+            result = bytearray(w * h * out_bpp)
+            dst = 0
             cmap = self.fb._colourmap
             for row in range(h):
                 src_off = ((y + row) * self.fb.width + x) * fb_bpp

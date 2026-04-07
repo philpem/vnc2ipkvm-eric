@@ -124,9 +124,13 @@ class Framebuffer:
 
     def to_rgb888(self, x: int, y: int, w: int, h: int) -> bytes:
         """Convert a region to RGB888 bytes (3 bytes per pixel)."""
-        result = bytearray(w * h * 3)
-        dst = 0
         with self.lock:
+            w = min(w, self.width - x)
+            h = min(h, self.height - y)
+            if w <= 0 or h <= 0:
+                return b""
+            result = bytearray(w * h * 3)
+            dst = 0
             if self.bytes_per_pixel == 1:
                 cmap = self._colourmap
                 stride = self.width
@@ -155,9 +159,24 @@ class Framebuffer:
 
     def to_bgrx(self, x: int, y: int, w: int, h: int) -> bytes:
         """Convert a region to BGRX bytes (4 bytes per pixel, standard VNC 32-bit)."""
-        result = bytearray(w * h * 4)
-        dst = 0
         with self.lock:
+            # Clamp region to framebuffer bounds
+            w = min(w, self.width - x)
+            h = min(h, self.height - y)
+            if w <= 0 or h <= 0:
+                return b""
+            expected = self.width * self.height * self.bytes_per_pixel
+            actual = len(self.pixels)
+            if actual != expected:
+                import logging
+                logging.getLogger(__name__).error(
+                    "Framebuffer size mismatch: %dx%d bpp=%d expects %d bytes, "
+                    "have %d bytes. Region: x=%d y=%d w=%d h=%d",
+                    self.width, self.height, self.bytes_per_pixel,
+                    expected, actual, x, y, w, h)
+                return b"\x00" * (w * h * 4)
+            result = bytearray(w * h * 4)
+            dst = 0
             if self.bytes_per_pixel == 1:
                 cmap = self._colourmap
                 stride = self.width
