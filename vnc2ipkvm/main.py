@@ -102,7 +102,7 @@ class Bridge:
         """Handle server commands like exclusive_mode, rc_users, etc."""
         key_lower = key.lower()
         if key_lower == "exclusive_mode":
-            self.kvm.exclusive_mode = (value.lower() == "on")
+            self.kvm.exclusive_mode = value.lower() in ("on", "active")
             logger.info("Exclusive access: %s", value)
         elif key_lower == "rc_users":
             try:

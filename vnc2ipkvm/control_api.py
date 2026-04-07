@@ -210,25 +210,20 @@ class ControlAPI:
                 return await self._handle_type_string(body, kvm)
             return (400, {"error": "use /keyboard/release-all or /keyboard/type"})
 
-        # POST /rdp/on or /rdp/off
-        if segments[0] == "rdp" and len(segments) >= 2:
-            if segments[1] == "on":
-                await kvm.send_mode_command(0)
-                return (200, {"ok": True, "action": "rdp", "state": "on"})
-            elif segments[1] == "off":
-                await kvm.send_mode_command(3)
-                return (200, {"ok": True, "action": "rdp", "state": "off"})
-            return (400, {"error": "use /rdp/on or /rdp/off"})
+        # POST /rdp/on — enter Remote Desktop mode
+        if segments[0] == "rdp" and len(segments) >= 2 and segments[1] == "on":
+            await kvm.send_mode_command(0)
+            return (200, {"ok": True, "action": "rdp", "state": "on"})
 
-        # POST /host-direct/on or /host-direct/off
-        if segments[0] == "host-direct" and len(segments) >= 2:
-            if segments[1] == "on":
-                await kvm.send_mode_command(2)
-                return (200, {"ok": True, "action": "host_direct", "state": "on"})
-            elif segments[1] == "off":
-                await kvm.send_mode_command(3)
-                return (200, {"ok": True, "action": "host_direct", "state": "off"})
-            return (400, {"error": "use /host-direct/on or /host-direct/off"})
+        # POST /host-direct/on — enter Host Acceleration mode
+        if segments[0] == "host-direct" and len(segments) >= 2 and segments[1] == "on":
+            await kvm.send_mode_command(2)
+            return (200, {"ok": True, "action": "host_direct", "state": "on"})
+
+        # POST /mode/exit — exit current mode (RDP or Host Direct)
+        if segments[0] == "mode" and len(segments) >= 2 and segments[1] == "exit":
+            await kvm.send_mode_command(3)
+            return (200, {"ok": True, "action": "mode_exit"})
 
         return (404, {"error": f"unknown endpoint: {path}",
                       "hint": "try GET /help"})
@@ -282,8 +277,9 @@ class ControlAPI:
                 "POST /exclusive/on|off": "Enable/disable exclusive access",
                 "POST /keyboard/release-all": "Release all held modifier keys",
                 "POST /keyboard/type": "Type a string (send in request body)",
-                "POST /rdp/on|off": "Enter/exit Remote Desktop mode",
-                "POST /host-direct/on|off": "Enter/exit Host Acceleration mode",
+                "POST /rdp/on": "Enter Remote Desktop mode",
+                "POST /host-direct/on": "Enter Host Acceleration mode",
+                "POST /mode/exit": "Exit current mode (RDP or Host Direct)",
             }
         })
 
@@ -499,13 +495,14 @@ _WEB_UI_HTML = """\
     <label>Remote Desktop:</label>
     <span id="rdp-state" style="margin-right:8px">—</span>
     <button class="btn" onclick="postAction('/rdp/on')">Enter</button>
-    <button class="btn" onclick="postAction('/rdp/off')">Exit</button>
   </div>
   <div class="form-row">
     <label>Host Acceleration:</label>
     <span id="hd-state" style="margin-right:8px">—</span>
     <button class="btn" onclick="postAction('/host-direct/on')">Enter</button>
-    <button class="btn" onclick="postAction('/host-direct/off')">Exit</button>
+  </div>
+  <div class="btn-row" style="margin-top:8px">
+    <button class="btn" onclick="postAction('/mode/exit')">Exit Current Mode</button>
   </div>
   <div class="form-row" style="margin-top:12px">
     <label>Exclusive Access:</label>

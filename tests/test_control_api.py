@@ -284,18 +284,13 @@ class TestControlAPIRouting(unittest.TestCase):
         self.assertEqual(result[1]["action"], "rdp")
         self.bridge.kvm.send_mode_command.assert_awaited_once_with(0)
 
-    def test_rdp_off(self):
-        result = self._route("POST", "/rdp/off")
-        self.assertEqual(result[0], 200)
-        self.bridge.kvm.send_mode_command.assert_awaited_once_with(3)
-
     def test_host_direct_on(self):
         result = self._route("POST", "/host-direct/on")
         self.assertEqual(result[0], 200)
         self.bridge.kvm.send_mode_command.assert_awaited_once_with(2)
 
-    def test_host_direct_off(self):
-        result = self._route("POST", "/host-direct/off")
+    def test_mode_exit(self):
+        result = self._route("POST", "/mode/exit")
         self.assertEqual(result[0], 200)
         self.bridge.kvm.send_mode_command.assert_awaited_once_with(3)
 

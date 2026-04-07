@@ -559,10 +559,16 @@ class ERICProtocol:
                 self.rdp_mode = False
                 if status == 2:
                     self.rdp_available = False
+                if status == 1:
+                    # Left RDP mode — request full framebuffer refresh
+                    await self.send_fb_update_request(incremental=False)
             elif status == 3:
                 self.host_direct_mode = True
             elif status in (4, 5):
                 self.host_direct_mode = False
+                if status == 4:
+                    # Left Host Direct mode — request full framebuffer refresh
+                    await self.send_fb_update_request(incremental=False)
         else:
             # Unknown message type — log but don't disconnect. The stream
             # may be misaligned, but stopping is worse than trying to continue.
