@@ -208,7 +208,9 @@ class ControlAPI:
                 return (200, {"ok": True, "action": "release_all_modifiers"})
             if segments[1] == "type":
                 return await self._handle_type_string(body, kvm)
-            return (400, {"error": "use /keyboard/release-all or /keyboard/type"})
+            if segments[1] == "send":
+                return await self._handle_send_scancodes(body, kvm)
+            return (400, {"error": "use /keyboard/release-all, /keyboard/type, or /keyboard/send"})
 
         # POST /hotkey/<index>
         if segments[0] == "hotkey" and len(segments) >= 2:
@@ -283,6 +285,7 @@ class ControlAPI:
                 "POST /exclusive/on|off": "Enable/disable exclusive access",
                 "POST /keyboard/release-all": "Release all held modifier keys",
                 "POST /keyboard/type": "Type a string (send in request body)",
+                "POST /keyboard/send": "Send hex scan codes (e.g. '36 f0 37 f0 4e' for Ctrl+Alt+Del)",
                 "POST /hotkey/<n>": "Send hotkey n (from KVM configuration)",
                 "POST /rdp/on": "Enter Remote Desktop mode",
                 "POST /host-direct/on": "Enter Host Acceleration mode",
@@ -358,8 +361,47 @@ class ControlAPI:
         return (200, {"ok": True, "action": "type", "chars_typed": typed,
                       "chars_total": len(text)})
 
+    async def _send_scancode_sequence(self, hex_codes: str, kvm) -> int:
+        """Execute a scan code sequence. Returns number of keys sent.
+
+        Codes are space-separated hex bytes. Special control codes:
+          F0 = separator (ignored)
+          F1 = release all held keys
+          F2 = pause (100ms)
+          F3 = release last key pressed
+        All other values are e-RIC scan codes (pressed in order,
+        accumulated on a stack, released in reverse at the end).
+        """
+        codes = hex_codes.split()
+        pressed = []
+        sent = 0
+
+        for hex_code in codes:
+            code = int(hex_code, 16)
+            if code == 0xF0:
+                continue
+            elif code == 0xF1:
+                for sc in reversed(pressed):
+                    await kvm.send_key_event(sc, False)
+                pressed.clear()
+            elif code == 0xF2:
+                await asyncio.sleep(0.1)
+            elif code == 0xF3:
+                if pressed:
+                    await kvm.send_key_event(pressed.pop(), False)
+            else:
+                pressed.append(code)
+                await kvm.send_key_event(code, True)
+                sent += 1
+                await asyncio.sleep(0.02)
+
+        for sc in reversed(pressed):
+            await kvm.send_key_event(sc, False)
+
+        return sent
+
     async def _handle_hotkey(self, index_str: str, kvm) -> tuple[int, dict]:
-        """Execute a hotkey by index — sends the scan code sequence."""
+        """Execute a hotkey by index."""
         try:
             index = int(index_str)
         except ValueError:
@@ -370,37 +412,27 @@ class ControlAPI:
             return (400, {"error": f"hotkey index {index} out of range (0-{len(hotkeys)-1})"})
 
         hotkey = hotkeys[index]
-        codes = hotkey["codes"].split()
-        pressed = []  # stack of pressed keys
-
-        for hex_code in codes:
-            code = int(hex_code, 16)
-            if code == 0xF0:
-                continue  # separator, skip
-            elif code == 0xF1:
-                # Release all held keys
-                for sc in reversed(pressed):
-                    await kvm.send_key_event(sc, False)
-                pressed.clear()
-            elif code == 0xF2:
-                # Pause
-                await asyncio.sleep(0.1)
-            elif code == 0xF3:
-                # Release one key
-                if pressed:
-                    await kvm.send_key_event(pressed.pop(), False)
-            else:
-                # Press key
-                pressed.append(code)
-                await kvm.send_key_event(code, True)
-                await asyncio.sleep(0.02)
-
-        # Release any remaining keys
-        for sc in reversed(pressed):
-            await kvm.send_key_event(sc, False)
-
+        sent = await self._send_scancode_sequence(hotkey["codes"], kvm)
         return (200, {"ok": True, "action": "hotkey",
-                      "index": index, "label": hotkey["label"]})
+                      "index": index, "label": hotkey["label"], "keys_sent": sent})
+
+    async def _handle_send_scancodes(self, body: bytes, kvm) -> tuple[int, dict]:
+        """Send a raw scan code sequence from the request body."""
+        text = body.decode("utf-8", errors="replace").strip()
+        if not text:
+            return (400, {"error": "provide hex scan codes in request body"})
+
+        # Validate all tokens are valid hex
+        for token in text.split():
+            try:
+                val = int(token, 16)
+                if val < 0 or val > 255:
+                    return (400, {"error": f"value '{token}' out of range (00-FF)"})
+            except ValueError:
+                return (400, {"error": f"invalid hex code: '{token}'"})
+
+        sent = await self._send_scancode_sequence(text, kvm)
+        return (200, {"ok": True, "action": "send", "keys_sent": sent})
 
 
 # ---------------------------------------------------------------------------
@@ -553,9 +585,27 @@ _WEB_UI_HTML = """\
     <input type="text" id="type-text" placeholder="Text to type on KVM...">
     <button class="btn primary" onclick="typeText()">Send</button>
   </div>
+  <div class="form-row">
+    <label>Send codes:</label>
+    <input type="text" id="send-codes" placeholder="e.g. 36 f0 37 f0 4e">
+    <button class="btn primary" onclick="sendCodes()">Send</button>
+  </div>
   <div class="btn-row" style="margin-top:8px">
     <button class="btn" onclick="postAction('/keyboard/release-all')">Release All Keys</button>
   </div>
+  <details style="margin-top:10px;font-size:0.8em;color:#aaa">
+    <summary style="cursor:pointer;color:#93c5fd">Scan code reference</summary>
+    <div style="margin-top:6px;line-height:1.6">
+      <b>Modifiers:</b> 29=LShift, 35=RShift, 36=LCtrl, 3A=RCtrl, 37=LAlt, 39=RAlt/AltGr<br>
+      <b>F-keys:</b> 3C=F1, 3D=F2, 3E=F3, 3F=F4, 40=F5, 41=F6, 42=F7, 43=F8, 44=F9, 45=F10, 46=F11, 47=F12<br>
+      <b>Navigation:</b> 4B=Insert, 4E=Delete, 4C=Home, 4F=End, 4D=PgUp, 50=PgDn<br>
+      <b>Arrows:</b> 51=Up, 52=Left, 53=Down, 54=Right<br>
+      <b>Control:</b> 1B=Enter, 3B=Escape, 0E=Tab, 0D=Backspace, 38=Space, 1C=CapsLock<br>
+      <b>Other:</b> 48=PrintScr, 4A=Pause, 55=NumLock, 49=ScrollLock<br>
+      <b>Special:</b> F0=separator(skip), F1=release all, F2=pause(100ms), F3=release last<br>
+      <b>Example:</b> <code>36 f0 37 f0 4e</code> = Ctrl+Alt+Delete
+    </div>
+  </details>
 </div>
 
 </div><!-- container -->
@@ -728,6 +778,23 @@ async function refreshStatus() {
     document.getElementById('dot').className = 'dot off';
     document.getElementById('conn-status').textContent = 'API unreachable';
   }
+}
+
+async function sendCodes() {
+  const codes = document.getElementById('send-codes').value.trim();
+  if (!codes) return;
+  try {
+    const r = await fetch(API + '/keyboard/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: codes
+    });
+    const j = await r.json();
+    if (j.ok) {
+      toast('Sent ' + j.keys_sent + ' keys', 'ok');
+      document.getElementById('send-codes').value = '';
+    } else toast(j.error || 'Error', 'err');
+  } catch (e) { toast('Request failed: ' + e.message, 'err'); }
 }
 
 function sendHotkey(idx, label, needsConfirm) {
