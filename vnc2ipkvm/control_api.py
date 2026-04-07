@@ -466,10 +466,28 @@ _WEB_UI_HTML = """\
     <input type="number" id="kvm-port" value="1" min="1" max="16" style="max-width:80px">
     <button class="btn primary" onclick="postAction('/kvm/port/'+document.getElementById('kvm-port').value)">Switch</button>
   </div>
-  <div class="form-row" style="margin-top:16px">
+  <div class="form-row" style="margin-top:12px">
     <label>Exclusive Access:</label>
     <button class="btn" onclick="postAction('/exclusive/on')">Enable</button>
     <button class="btn" onclick="postAction('/exclusive/off')">Disable</button>
+  </div>
+  <div class="form-row">
+    <label></label>
+    <span id="excl-state" style="font-size:0.85em;color:#93c5fd">—</span>
+    <span style="font-size:0.85em;color:#888;margin-left:12px">Users: <span id="user-count">—</span></span>
+  </div>
+  <div class="form-row" style="margin-top:12px">
+    <label>Remote Desktop:</label>
+    <span id="rdp-state" style="margin-right:8px;font-size:0.85em;color:#93c5fd">—</span>
+    <button class="btn" onclick="postAction('/rdp/on')">Enter</button>
+  </div>
+  <div class="form-row">
+    <label>Host Acceleration:</label>
+    <span id="hd-state" style="margin-right:8px;font-size:0.85em;color:#93c5fd">—</span>
+    <button class="btn" onclick="postAction('/host-direct/on')">Enter</button>
+  </div>
+  <div class="btn-row" style="margin-top:8px">
+    <button class="btn" onclick="postAction('/mode/exit')">Exit Current Mode</button>
   </div>
 </div>
 
@@ -485,32 +503,6 @@ _WEB_UI_HTML = """\
   </div>
   <div class="btn-row" style="margin-top:8px">
     <button class="btn" onclick="postAction('/keyboard/release-all')">Release All Keys</button>
-  </div>
-</div>
-
-<!-- Mode & Status -->
-<div class="card">
-  <h2>Mode &amp; Status</h2>
-  <div class="form-row">
-    <label>Remote Desktop:</label>
-    <span id="rdp-state" style="margin-right:8px">—</span>
-    <button class="btn" onclick="postAction('/rdp/on')">Enter</button>
-  </div>
-  <div class="form-row">
-    <label>Host Acceleration:</label>
-    <span id="hd-state" style="margin-right:8px">—</span>
-    <button class="btn" onclick="postAction('/host-direct/on')">Enter</button>
-  </div>
-  <div class="btn-row" style="margin-top:8px">
-    <button class="btn" onclick="postAction('/mode/exit')">Exit Current Mode</button>
-  </div>
-  <div class="form-row" style="margin-top:12px">
-    <label>Exclusive Access:</label>
-    <span id="excl-state" style="margin-right:8px">—</span>
-  </div>
-  <div class="form-row">
-    <label>Connected Users:</label>
-    <span id="user-count">—</span>
   </div>
 </div>
 
