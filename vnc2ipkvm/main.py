@@ -101,12 +101,18 @@ class Bridge:
         """Handle server commands like exclusive_mode, rc_users, etc."""
         key_lower = key.lower()
         if key_lower == "exclusive_mode":
+            self.kvm.exclusive_mode = (value.lower() == "on")
             logger.info("Exclusive access: %s", value)
         elif key_lower == "rc_users":
+            try:
+                self.kvm.connected_users = int(value)
+            except ValueError:
+                pass
             logger.info("Connected users: %s", value)
         elif key_lower == "wlan_quality":
             logger.info("WLAN quality: %s%%", value)
         elif key_lower == "rdp_enabled":
+            self.kvm.rdp_available = (value.lower() == "yes")
             logger.info("RDP available: %s", value)
 
     # ---- VNC -> KVM callbacks ----

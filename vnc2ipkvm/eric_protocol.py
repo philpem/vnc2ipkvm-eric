@@ -108,6 +108,14 @@ class ERICProtocol:
         # Video settings from the KVM
         self.video_settings = VideoSettings()
 
+        # Mode and state tracking
+        self.exclusive_mode: bool | None = None  # None = unknown
+        self.rdp_mode: bool = False
+        self.host_direct_mode: bool = False
+        self.rdp_available: bool | None = None
+        self.connected_users: int | None = None
+        self.current_port: int = config.port_id
+
         # Callbacks
         self.on_bell = None
         self.on_resize = None
@@ -386,6 +394,7 @@ class ERICProtocol:
         """Send KVM port switch command (type 0x89)."""
         msg = struct.pack(">BxH", 0x89, port & 0xFFFF)
         await self._write(msg)
+        self.current_port = port
 
     async def send_video_setting(self, setting_id: int, value: int):
         """Send a video setting change (type 0x90).
@@ -401,17 +410,12 @@ class ERICProtocol:
         """Send video settings request (type 0x91). cmd=1 to open, cmd=2 to close."""
         await self._write(bytes([0x91, cmd & 0xFF]))
 
-    async def send_power_command(self, cmd: int):
-        """Send power control command (type 0xA0).
+    async def send_mode_command(self, cmd: int):
+        """Send RDP/Host Direct mode command (type 0xA0).
 
-        cmd=0: enter RDP mode, cmd=1: other power actions
-        """
-        await self._write(bytes([0xA0, cmd & 0xFF]))
-
-    async def send_rdp_mode(self, cmd: int):
-        """Send RDP/Host Direct mode request (type 0xA0).
-
-        cmd=0: request enter RDP, etc.
+        cmd=0: enter RDP mode (Java: "Remote Desktop Mode" menu item)
+        cmd=2: enter Host Direct mode (Java: "Host Acceleration Mode" menu item)
+        cmd=3: exit mode (sent on session teardown)
         """
         await self._write(bytes([0xA0, cmd & 0xFF]))
 
@@ -546,6 +550,16 @@ class ERICProtocol:
                      2: "RDP Mode unavailable", 3: "Entered Host Direct Mode",
                      4: "Left Host Direct Mode", 5: "Host Direct Mode unavailable"}
             logger.info("Mode switch: %s", modes.get(status, f"unknown {status}"))
+            if status == 0:
+                self.rdp_mode = True
+            elif status in (1, 2):
+                self.rdp_mode = False
+                if status == 2:
+                    self.rdp_available = False
+            elif status == 3:
+                self.host_direct_mode = True
+            elif status in (4, 5):
+                self.host_direct_mode = False
         else:
             # Unknown message type — log but don't disconnect. The stream
             # may be misaligned, but stopping is worse than trying to continue.
@@ -567,8 +581,6 @@ class ERICProtocol:
             h = await self._read_u16()
             enc_bytes = await self._read_exactly(4)
             enc = struct.unpack(">i", enc_bytes)[0]
-            logger.debug("  rect %d: x=%d y=%d w=%d h=%d enc=%d (0x%08x)",
-                         i, x, y, w, h, enc, enc & 0xFFFFFFFF)
 
             if enc == ENC_RAW:
                 await self._decode_raw(x, y, w, h)
@@ -642,10 +654,6 @@ class ERICProtocol:
                                  flags, bpp,
                                  (w + 15) // 16, (h + 15) // 16)
                     first_tile = False
-                elif (w > 16 or h > 16):
-                    # Log all tile flags for multi-tile rects
-                    logger.debug("    hextile tile@%d,%d: flags=0x%02x",
-                                 tx, ty, flags)
 
                 if flags & 0x01:
                     # Raw tile
@@ -760,12 +768,10 @@ class ERICProtocol:
                 self._inflaters[i] = None
 
         sub_enc = (control >> 4) & 0x0F
-        logger.debug("    tight: control=0x%02x sub_enc=%d", control, sub_enc)
 
         # Solid fill (always 1-byte RGB332 in tight 8-bit encoding)
         if sub_enc == 0x08:
             color = await self._read_byte()
-            logger.debug("    tight: solid fill color=%d", color)
             self.fb.fill_rect(x, y, w, h, color)
             return
 
@@ -794,12 +800,9 @@ class ERICProtocol:
             filter_byte = await self._read_byte()
             filter_type = filter_byte & 0x0F
             palette_depth = (filter_byte >> 4) & 0x0F
-            logger.debug("    tight: filter type=%d palette_depth=%d", filter_type, palette_depth)
-
             if filter_type == 1:
                 # Palette filter
                 num_colors = (await self._read_byte()) + 1
-                logger.debug("    tight: palette num_colors=%d", num_colors)
                 if num_colors == 2:
                     # Read packed 2-color palette
                     palette_colors = [0, 0]
@@ -846,11 +849,9 @@ class ERICProtocol:
         data_len = h * row_bytes
         if data_len < 12:
             pixel_data = await self._read_exactly(data_len)
-            logger.debug("    tight: raw data_len=%d", data_len)
         else:
             zlib_len = await self._read_compact_len()
             zlib_data = await self._read_exactly(zlib_len)
-            logger.debug("    tight: zlib_len=%d data_len=%d", zlib_len, data_len)
             pixel_data = self._inflate(stream_idx, zlib_data, data_len)
 
         # Decode into framebuffer
@@ -1055,10 +1056,8 @@ class ERICProtocol:
         num_colours = (header[3] << 8) | header[4]
         body_len = num_colours * 6
 
-        logger.debug("SetColourMapEntries: padding=0x%02x first=%d count=%d "
-                     "body_len=%d header=%s",
-                     padding, first_colour, num_colours, body_len,
-                     header.hex(' '))
+        logger.debug("SetColourMapEntries: first=%d count=%d",
+                     first_colour, num_colours)
 
         # Sanity check — if values look wrong, the format may differ
         if num_colours > 256 or first_colour > 255:
@@ -1071,11 +1070,6 @@ class ERICProtocol:
             return
 
         data = await self._read_exactly(body_len)
-
-        # Peek at next byte in stream buffer for alignment check
-        if hasattr(self.reader, '_buffer') and len(self.reader._buffer) > 0:
-            next_byte = self.reader._buffer[0]
-            logger.debug("  next msg byte after colourmap: 0x%02x", next_byte)
 
         # Update the colour map with the new entries
         for i in range(num_colours):

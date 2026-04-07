@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Video setting name -> (setting_id, min, max)
 VIDEO_SETTINGS = {
-    "brightness":      (0, 0, 127),   # Java advanced mode: 0-127
+    "brightness":      (0, 0, 127),   # KVM firmware wraps at 128, cap to 127
     "contrast":        (1, 0, 255),
     "contrast-red":    (1, 0, 255),
     "contrast-green":  (2, 0, 255),
@@ -210,14 +210,25 @@ class ControlAPI:
                 return await self._handle_type_string(body, kvm)
             return (400, {"error": "use /keyboard/release-all or /keyboard/type"})
 
-        # POST /power/<cmd>
-        if segments[0] == "power" and len(segments) >= 2:
-            try:
-                cmd = int(segments[1])
-            except ValueError:
-                return (400, {"error": "power command must be an integer"})
-            await kvm.send_power_command(cmd)
-            return (200, {"ok": True, "action": "power", "cmd": cmd})
+        # POST /rdp/on or /rdp/off
+        if segments[0] == "rdp" and len(segments) >= 2:
+            if segments[1] == "on":
+                await kvm.send_mode_command(0)
+                return (200, {"ok": True, "action": "rdp", "state": "on"})
+            elif segments[1] == "off":
+                await kvm.send_mode_command(3)
+                return (200, {"ok": True, "action": "rdp", "state": "off"})
+            return (400, {"error": "use /rdp/on or /rdp/off"})
+
+        # POST /host-direct/on or /host-direct/off
+        if segments[0] == "host-direct" and len(segments) >= 2:
+            if segments[1] == "on":
+                await kvm.send_mode_command(2)
+                return (200, {"ok": True, "action": "host_direct", "state": "on"})
+            elif segments[1] == "off":
+                await kvm.send_mode_command(3)
+                return (200, {"ok": True, "action": "host_direct", "state": "off"})
+            return (400, {"error": "use /host-direct/on or /host-direct/off"})
 
         return (404, {"error": f"unknown endpoint: {path}",
                       "hint": "try GET /help"})
@@ -247,6 +258,12 @@ class ControlAPI:
             },
             "keyboard_layout": self.bridge.keyboard_layout,
             "vnc_clients": len(self.bridge.vnc._clients),
+            "kvm_port": kvm.current_port,
+            "exclusive_mode": kvm.exclusive_mode,
+            "rdp_mode": kvm.rdp_mode,
+            "rdp_available": kvm.rdp_available,
+            "host_direct_mode": kvm.host_direct_mode,
+            "connected_users": kvm.connected_users,
         })
 
     def _help(self) -> tuple[int, dict]:
@@ -264,7 +281,8 @@ class ControlAPI:
                 "POST /exclusive/on|off": "Enable/disable exclusive access",
                 "POST /keyboard/release-all": "Release all held modifier keys",
                 "POST /keyboard/type": "Type a string (send in request body)",
-                "POST /power/<cmd>": "Send power command (integer)",
+                "POST /rdp/on|off": "Enter/exit Remote Desktop mode",
+                "POST /host-direct/on|off": "Enter/exit Host Acceleration mode",
             }
         })
 
@@ -373,8 +391,10 @@ _WEB_UI_HTML = """\
   .slider-row label { width: 130px; text-align: right; font-size: 0.85em;
                       flex-shrink: 0; }
   .slider-row input[type=range] { flex: 1; accent-color: #60a5fa; }
-  .slider-row .val { width: 48px; text-align: right; font-size: 0.85em;
-                     font-variant-numeric: tabular-nums; color: #93c5fd; }
+  .slider-row .spin { width: 64px; text-align: right; font-size: 0.85em;
+                      font-variant-numeric: tabular-nums; color: #93c5fd;
+                      background: #0f172a; border: 1px solid #334155;
+                      border-radius: 4px; padding: 2px 4px; }
 
   .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
   .btn { padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer;
@@ -416,13 +436,14 @@ _WEB_UI_HTML = """\
   <span id="srv-name"></span>
   <span id="resolution"></span>
   <span id="vnc-clients"></span>
+  <span>Port: <span id="kvm-port-display">—</span></span>
 </div>
 
 <div class="grid-2">
 
 <!-- Video Settings -->
 <div class="card">
-  <h2>Video Settings</h2>
+  <h2>Video Settings <button class="btn" id="mode-toggle" onclick="toggleMode()" style="float:right;font-size:0.75em">Advanced</button></h2>
   <div id="video-sliders"></div>
   <div class="btn-row">
     <button class="btn primary" onclick="postAction('/video/auto-adjust')">Auto Adjust</button>
@@ -463,11 +484,28 @@ _WEB_UI_HTML = """\
   </div>
 </div>
 
-<!-- Power -->
+<!-- Mode & Status -->
 <div class="card">
-  <h2>Power Control</h2>
-  <div class="btn-row">
-    <button class="btn danger" onclick="if(confirm('Send power command?')) postAction('/power/0')">Power Command</button>
+  <h2>Mode &amp; Status</h2>
+  <div class="form-row">
+    <label>Remote Desktop:</label>
+    <span id="rdp-state" style="margin-right:8px">—</span>
+    <button class="btn" onclick="postAction('/rdp/on')">Enter</button>
+    <button class="btn" onclick="postAction('/rdp/off')">Exit</button>
+  </div>
+  <div class="form-row">
+    <label>Host Acceleration:</label>
+    <span id="hd-state" style="margin-right:8px">—</span>
+    <button class="btn" onclick="postAction('/host-direct/on')">Enter</button>
+    <button class="btn" onclick="postAction('/host-direct/off')">Exit</button>
+  </div>
+  <div class="form-row" style="margin-top:12px">
+    <label>Exclusive Access:</label>
+    <span id="excl-state" style="margin-right:8px">—</span>
+  </div>
+  <div class="form-row">
+    <label>Connected Users:</label>
+    <span id="user-count">—</span>
   </div>
 </div>
 
@@ -478,9 +516,15 @@ _WEB_UI_HTML = """\
 <script>
 const API = '';  // same origin
 
-const SLIDERS = [
+const SLIDERS_STD = [
   { name: 'brightness',      label: 'Brightness',      key: 'brightness',      min: 0, max: 127 },
   { name: 'contrast',        label: 'Contrast',         key: 'contrast',        min: 0, max: 255 },
+  { name: 'h-offset',        label: 'H Offset',         key: 'h_offset',        min: 0, max: 512 },
+  { name: 'v-offset',        label: 'V Offset',         key: 'v_offset',        min: 0, max: 128 },
+];
+const SLIDERS_ADV = [
+  { name: 'brightness',      label: 'Brightness',      key: 'brightness',      min: 0, max: 127 },
+  { name: 'contrast',        label: 'Contrast Red',     key: 'contrast',        min: 0, max: 255 },
   { name: 'contrast-green',  label: 'Contrast Green',   key: 'contrast_green',  min: 0, max: 255 },
   { name: 'contrast-blue',   label: 'Contrast Blue',    key: 'contrast_blue',   min: 0, max: 255 },
   { name: 'clock',           label: 'Clock',            key: 'clock',           min: 0, max: 4320 },
@@ -488,32 +532,55 @@ const SLIDERS = [
   { name: 'h-offset',        label: 'H Offset',         key: 'h_offset',        min: 0, max: 512 },
   { name: 'v-offset',        label: 'V Offset',         key: 'v_offset',        min: 0, max: 128 },
 ];
+let SLIDERS = SLIDERS_STD;
+let advancedMode = false;
 
 function buildSliders() {
   const c = document.getElementById('video-sliders');
+  c.innerHTML = '';
   SLIDERS.forEach(s => {
     const row = document.createElement('div');
     row.className = 'slider-row';
     row.innerHTML =
       '<label>' + s.label + '</label>' +
       '<input type="range" min="' + s.min + '" max="' + s.max + '" value="0" ' +
-        'id="sl-' + s.name + '" oninput="sliderChanged(this, \\'' + s.name + '\\')">' +
-      '<span class="val" id="sv-' + s.name + '">0</span>';
+        'id="sl-' + s.name + '" oninput="sliderInput(this, \\'' + s.name + '\\')">' +
+      '<input type="number" min="' + s.min + '" max="' + s.max + '" value="0" ' +
+        'id="sv-' + s.name + '" class="spin" ' +
+        'onchange="spinChanged(this, \\'' + s.name + '\\')">';
     c.appendChild(row);
   });
 }
 
+function toggleMode() {
+  advancedMode = !advancedMode;
+  SLIDERS = advancedMode ? SLIDERS_ADV : SLIDERS_STD;
+  document.getElementById('mode-toggle').textContent = advancedMode ? 'Standard' : 'Advanced';  // shows what you'd switch TO
+  buildSliders();
+  refreshStatus();
+}
+
 let sliderTimer = {};
-function sliderChanged(el, name) {
-  document.getElementById('sv-' + name).textContent = el.value;
+function sliderInput(el, name) {
+  document.getElementById('sv-' + name).value = el.value;
+  clearTimeout(sliderTimer[name]);
+  sliderTimer[name] = setTimeout(() => {
+    postAction('/video/' + name + '/' + el.value);
+  }, 150);
+}
+function spinChanged(el, name) {
+  const slider = document.getElementById('sl-' + name);
+  if (slider) slider.value = el.value;
   clearTimeout(sliderTimer[name]);
   sliderTimer[name] = setTimeout(() => {
     postAction('/video/' + name + '/' + el.value);
   }, 150);
 }
 
+let pauseRefreshUntil = 0;
 async function postAction(path) {
   try {
+    pauseRefreshUntil = Date.now() + 2000;  // pause auto-refresh for 2s after action
     const r = await fetch(API + path, { method: 'POST' });
     const j = await r.json();
     if (j.ok) toast(JSON.stringify(j), 'ok');
@@ -547,6 +614,7 @@ function toast(msg, type) {
 }
 
 async function refreshStatus() {
+  if (Date.now() < pauseRefreshUntil) return;  // skip during slider interaction
   try {
     const r = await fetch(API + '/status');
     const s = await r.json();
@@ -568,16 +636,29 @@ async function refreshStatus() {
     document.getElementById('vnc-clients').textContent =
       (s.vnc_clients || 0) + ' VNC client' + (s.vnc_clients !== 1 ? 's' : '');
 
-    // Update sliders to match server values
+    const portEl = document.getElementById('kvm-port-display');
+    if (portEl) portEl.textContent = s.kvm_port != null ? s.kvm_port : '—';
+
+    // Mode & status
+    const rdpEl = document.getElementById('rdp-state');
+    if (rdpEl) rdpEl.textContent = s.rdp_mode ? 'Active' :
+      (s.rdp_available === false ? 'Unavailable' : 'Off');
+    const hdEl = document.getElementById('hd-state');
+    if (hdEl) hdEl.textContent = s.host_direct_mode ? 'Active' : 'Off';
+    const exclEl = document.getElementById('excl-state');
+    if (exclEl) exclEl.textContent = s.exclusive_mode === true ? 'On' :
+      (s.exclusive_mode === false ? 'Off' : '—');
+    const userEl = document.getElementById('user-count');
+    if (userEl) userEl.textContent = s.connected_users != null ? s.connected_users : '—';
+
+    // Update sliders and spin inputs to match server values
     SLIDERS.forEach(sl => {
       const val = vs[sl.key];
       if (val !== undefined) {
-        const inp = document.getElementById('sl-' + sl.name);
-        const lbl = document.getElementById('sv-' + sl.name);
-        if (inp && document.activeElement !== inp) {
-          inp.value = val;
-          lbl.textContent = val;
-        }
+        const slider = document.getElementById('sl-' + sl.name);
+        const spin = document.getElementById('sv-' + sl.name);
+        if (slider && document.activeElement !== slider) slider.value = val;
+        if (spin && document.activeElement !== spin) spin.value = val;
       }
     });
   } catch (e) {

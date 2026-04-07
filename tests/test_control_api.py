@@ -39,7 +39,15 @@ def make_bridge(connected=True):
     kvm.send_exclusive_access = AsyncMock()
     kvm.send_release_all_modifiers = AsyncMock()
     kvm.send_key_event = AsyncMock()
-    kvm.send_power_command = AsyncMock()
+    kvm.send_mode_command = AsyncMock()
+
+    # State tracking
+    kvm.current_port = 0
+    kvm.exclusive_mode = None
+    kvm.rdp_mode = False
+    kvm.rdp_available = None
+    kvm.host_direct_mode = False
+    kvm.connected_users = None
 
     bridge.kvm = kvm
 
@@ -268,16 +276,27 @@ class TestControlAPIRouting(unittest.TestCase):
 
     # --- POST /power/<cmd> ---
 
-    def test_power_command(self):
-        result = self._route("POST", "/power/0")
+    def test_rdp_on(self):
+        result = self._route("POST", "/rdp/on")
         self.assertEqual(result[0], 200)
         self.assertTrue(result[1]["ok"])
-        self.assertEqual(result[1]["cmd"], 0)
-        self.bridge.kvm.send_power_command.assert_awaited_once_with(0)
+        self.assertEqual(result[1]["action"], "rdp")
+        self.bridge.kvm.send_mode_command.assert_awaited_once_with(0)
 
-    def test_power_invalid(self):
-        result = self._route("POST", "/power/abc")
-        self.assertEqual(result[0], 400)
+    def test_rdp_off(self):
+        result = self._route("POST", "/rdp/off")
+        self.assertEqual(result[0], 200)
+        self.bridge.kvm.send_mode_command.assert_awaited_once_with(3)
+
+    def test_host_direct_on(self):
+        result = self._route("POST", "/host-direct/on")
+        self.assertEqual(result[0], 200)
+        self.bridge.kvm.send_mode_command.assert_awaited_once_with(2)
+
+    def test_host_direct_off(self):
+        result = self._route("POST", "/host-direct/off")
+        self.assertEqual(result[0], 200)
+        self.bridge.kvm.send_mode_command.assert_awaited_once_with(3)
 
     # --- 404 ---
 
@@ -310,9 +329,9 @@ class TestControlAPIRouting(unittest.TestCase):
         result = self._route("POST", "/keyboard/release-all")
         self.assertEqual(result[0], 503)
 
-    def test_disconnected_power(self):
+    def test_disconnected_rdp(self):
         self.bridge.kvm.connected = False
-        result = self._route("POST", "/power/0")
+        result = self._route("POST", "/rdp/on")
         self.assertEqual(result[0], 503)
 
     def test_status_works_when_disconnected(self):
@@ -469,6 +488,9 @@ class TestWebUIContent(unittest.TestCase):
         self.assertIn("Contrast", html)
         self.assertIn("Clock", html)
         self.assertIn("Phase", html)
+        self.assertIn("SLIDERS_STD", html)
+        self.assertIn("SLIDERS_ADV", html)
+        self.assertIn("toggleMode", html)
 
     def test_has_video_buttons(self):
         html = self._get_html()
@@ -493,10 +515,12 @@ class TestWebUIContent(unittest.TestCase):
         self.assertIn('id="type-text"', html)
         self.assertIn("Release All Keys", html)
 
-    def test_has_power_section(self):
+    def test_has_mode_section(self):
         html = self._get_html()
-        self.assertIn("Power Control", html)
-        self.assertIn("/power/0", html)
+        self.assertIn("Mode", html)
+        self.assertIn("/rdp/on", html)
+        self.assertIn("/host-direct/on", html)
+        self.assertIn("Exclusive Access", html)
 
     def test_has_auto_refresh(self):
         html = self._get_html()
