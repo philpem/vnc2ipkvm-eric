@@ -48,7 +48,10 @@ class WebSocketProxy:
     async def stop(self):
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=2.0)
+            except asyncio.TimeoutError:
+                pass
 
     async def _handle_client(self, ws):
         """Handle a single WebSocket client by bridging to VNC."""

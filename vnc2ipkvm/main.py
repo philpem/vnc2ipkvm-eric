@@ -250,14 +250,26 @@ class Bridge:
         if self._kvm_task:
             self._kvm_task.cancel()
             try:
-                await self._kvm_task
-            except asyncio.CancelledError:
+                await asyncio.wait_for(self._kvm_task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
 
-        await self.kvm.disconnect()
-        await self.vnc.stop()
+        try:
+            await asyncio.wait_for(self.kvm.disconnect(), timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+        try:
+            await asyncio.wait_for(self.vnc.stop(), timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
         if self.api:
-            await self.api.stop()
+            try:
+                await asyncio.wait_for(self.api.stop(), timeout=3.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
+
         logger.info("Shutdown complete")
 
 
