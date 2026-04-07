@@ -102,9 +102,18 @@ class Bridge:
     def _on_kvm_disconnect(self):
         logger.warning("KVM connection lost")
         self._notify_ui()
-        if self.auto_reconnect and self._running:
+        if not self._running:
+            return
+        if self.auto_reconnect and self.login_credentials:
             asyncio.get_event_loop().call_soon(
                 lambda: asyncio.ensure_future(self._reconnect_kvm()))
+        else:
+            if not self.login_credentials:
+                logger.error("Cannot reconnect — no login credentials "
+                             "(use --user/--password instead of --applet-id)")
+            logger.info("Exiting")
+            asyncio.get_event_loop().call_soon(
+                lambda: asyncio.ensure_future(self.shutdown()))
 
     def _notify_ui(self):
         """Push status to SSE clients if control API is active."""

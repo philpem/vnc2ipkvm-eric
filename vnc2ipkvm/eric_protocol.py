@@ -322,7 +322,7 @@ class ERICProtocol:
 
     async def send_set_encodings(self):
         """Send SetEncodings (type 0x02)."""
-        encs = self.config.encodings
+        encs = list(self.config.encodings)
         n = len(encs)
         msg = struct.pack(">BBH", 2, 0, n)
         for enc in encs:
@@ -791,7 +791,7 @@ class ERICProtocol:
         # Read control byte
         control = await self._read_byte()
 
-        # Check for stream resets (low 4 bits)
+        # Check for stream resets (low 4 bits of control byte)
         for i in range(4):
             if (control >> i) & 1:
                 self._inflaters[i] = None
@@ -816,15 +816,17 @@ class ERICProtocol:
             self.fb.fill_rect(x, y, w, h, self._argb_to_native(color_val))
             return
 
-        # Determine packed pixel width based on sub-encoding
-        filter_id = sub_enc & 0x03
-        stream_idx = (sub_enc >> 2) & 0x03 if sub_enc < 8 else 0
+        # Stream index selection (Java ByteColorRFBRenderer.a() line 457):
+        #   if sub_enc bit 3 is set: use stream 0
+        #   else: use stream (sub_enc & 3) — i.e., one of 0..3
+        stream_idx = 0 if (sub_enc & 8) else (sub_enc & 3)
 
         # Check for 2-color palette mode
         palette_colors = None
         palette_lut = []
         use_gradient = False
-        row_bytes = w * self.bytes_per_pixel  # default: bpp bytes per pixel
+        # Default: direct pixels, bytes_per_pixel bytes per pixel
+        row_bytes = w * self.bytes_per_pixel
 
         if (sub_enc | 3) == 7:
             # Has filter
@@ -858,12 +860,11 @@ class ERICProtocol:
                         palette_colors[1] = RGB332_TO_ARGB[await self._read_byte()]
                     row_bytes = (w + 7) // 8
                 else:
-                    # Multi-color palette: num_colors * bpp bytes for palette,
-                    # then indexed pixel data
+                    # Multi-color palette: bytes_per_pixel bytes per colour
                     palette_lut = []
                     for _ in range(num_colors):
                         palette_lut.append(await self._read_pixel())
-                    # Each pixel is an index into the palette, 1 byte per pixel
+                    # Pixel data is 1-byte indices into the palette
                     row_bytes = w
             elif filter_type == 2:
                 # Gradient filter: each byte is delta from predicted value.
@@ -970,7 +971,11 @@ class ERICProtocol:
         return self._argb_to_rgb332(argb)
 
     def _inflate(self, stream_idx: int, data: bytes, expected_len: int) -> bytes:
-        """Decompress data using the specified zlib stream."""
+        """Decompress data using the specified zlib stream.
+
+        Streams are reset via the tight control byte's low 4 bits, which
+        the caller handles by setting _inflaters[i] = None before calling.
+        """
         if self._inflaters[stream_idx] is None:
             self._inflaters[stream_idx] = zlib.decompressobj()
         result = self._inflaters[stream_idx].decompress(data, expected_len)
@@ -1255,12 +1260,13 @@ class ERICProtocol:
     async def _handle_ping(self):
         """Handle ping (type 0x94) and send response.
 
-        Java ap.b(): 3 padding bytes + readInt (4 bytes) = 7 bytes total.
+        Java ap.b() (lines 617-622): 3 padding bytes + cfr_renamed_3()
+        which reads a variable-length compact integer (1-3 bytes).
         """
         await self._read_byte()  # padding
         await self._read_byte()  # padding
         await self._read_byte()  # padding
-        value = await self._read_u32()
+        value = await self._read_compact_len()
         await self.send_ping_response(0)
         logger.debug("Ping received (value=%d), pong sent", value)
 
