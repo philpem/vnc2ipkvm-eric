@@ -103,6 +103,7 @@ class ERICProtocol:
         # Colour map: maps 8-bit pixel values to (R8, G8, B8) tuples.
         # Initialized to RGB332, but updated by SetColourMapEntries from server.
         self._colourmap: list[tuple[int, int, int]] = list(RGB332_TO_RGB)
+        self._colourmap_applied = False  # True after first colour map is applied
 
         # Video settings from the KVM
         self.video_settings = VideoSettings()
@@ -329,13 +330,17 @@ class ERICProtocol:
         await self._write(make_key_event(scancode, pressed))
 
     async def send_pointer_event(self, x: int, y: int, button_mask: int, wheel: int = 0):
-        """Send a pointer event (type 0x05 or 0x93 with wheel)."""
+        """Send a pointer event (type 0x05 or 0x93 with wheel).
+
+        Java ap.a(): always 8 bytes = type(1) + buttons(1) + x(2) + y(2) + wheel(2).
+        Type is 0x93 for wheel events, 0x05 for regular movement.
+        """
         x = max(0, min(x, self.width - 1))
         y = max(0, min(y, self.height - 1))
         if wheel != 0:
             msg = struct.pack(">BBHHh", 0x93, button_mask & 0xFF, x, y, wheel)
         else:
-            msg = struct.pack(">BBHHHH", 5, button_mask & 0xFF, x, y, 0, 0)
+            msg = struct.pack(">BBHHh", 5, button_mask & 0xFF, x, y, 0)
         await self._write(msg)
 
     async def send_ping_response(self, value: int = 0):
@@ -453,7 +458,18 @@ class ERICProtocol:
 
         while self._running:
             try:
-                msg_type = await self._read_byte()
+                # Use a timeout on read so we can send periodic keepalive
+                # FBUpdateRequests even when the server is idle. The KVM
+                # disconnects after ~60 seconds without traffic.
+                msg_type = await asyncio.wait_for(
+                    self._read_byte(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # No message received for 30 seconds — send keepalive
+                try:
+                    await self.send_fb_update_request(incremental=True)
+                except Exception:
+                    break
+                continue
             except asyncio.IncompleteReadError:
                 logger.info("Connection closed by KVM")
                 break
@@ -472,10 +488,15 @@ class ERICProtocol:
 
             # Send incremental FBUpdateRequest after each message as a
             # keepalive (matching Java client x.java line 183).
-            try:
-                await self.send_fb_update_request(incremental=True)
-            except Exception:
-                break
+            # Skip after SetColourMapEntries and UpdatePalette — these are
+            # palette metadata and sending FBUpdateRequest after them creates
+            # a feedback loop where the server responds with more palette
+            # messages instead of framebuffer data.
+            if msg_type not in (MSG_SET_COLOURMAP, MSG_UPDATE_PALETTE):
+                try:
+                    await self.send_fb_update_request(incremental=True)
+                except Exception:
+                    break
 
         self.connected = False
         self._running = False
@@ -523,8 +544,9 @@ class ERICProtocol:
                      4: "Left Host Direct Mode", 5: "Host Direct Mode unavailable"}
             logger.info("Mode switch: %s", modes.get(status, f"unknown {status}"))
         else:
-            logger.warning("Unknown message type: %d (0x%02x)", msg_type, msg_type)
-            self._running = False
+            # Unknown message type — log but don't disconnect. The stream
+            # may be misaligned, but stopping is worse than trying to continue.
+            logger.warning("Unknown message type: %d (0x%02x) — skipping", msg_type, msg_type)
 
     # ---- Framebuffer update handling ----
 
@@ -559,6 +581,14 @@ class ERICProtocol:
                 await self._decode_tight_packed(x, y, w, h)
             else:
                 raise IOError(f"Unknown encoding type {enc} (0x{enc & 0xFFFFFFFF:08x})")
+
+        # After processing all rects, peek at stream for alignment check
+        if num_rects > 0 and hasattr(self.reader, '_buffer') and len(self.reader._buffer) > 0:
+            next_byte = self.reader._buffer[0]
+            if next_byte not in (0, 1, 2, 3, 7, 8, 9, 16, 17, 128, 131, 132, 148, 150, 161):
+                logger.warning("  POST-FB stream peek: 0x%02x — possible desync! "
+                               "buffer: %s", next_byte,
+                               bytes(self.reader._buffer[:16]).hex(' '))
 
     async def _decode_raw(self, x: int, y: int, w: int, h: int):
         """Decode Raw encoding (type 0): w*h*bytes_per_pixel bytes of pixel data."""
@@ -605,8 +635,14 @@ class ERICProtocol:
 
                 flags = await self._read_byte()
                 if first_tile:
-                    logger.debug("    hextile: flags=0x%02x bpp=%d", flags, bpp)
+                    logger.debug("    hextile: flags=0x%02x bpp=%d tiles=%dx%d",
+                                 flags, bpp,
+                                 (w + 15) // 16, (h + 15) // 16)
                     first_tile = False
+                elif (w > 16 or h > 16):
+                    # Log all tile flags for multi-tile rects
+                    logger.debug("    hextile tile@%d,%d: flags=0x%02x",
+                                 tx, ty, flags)
 
                 if flags & 0x01:
                     # Raw tile
@@ -1004,12 +1040,39 @@ class ERICProtocol:
 
         Standard RFB format: 1 padding + 2 first-colour + 2 num-colours,
         then num-colours * 6 bytes (uint16 R, G, B each).
-        The server sends this to define the palette for 8-bit pixel values.
+
+        NOTE: The Java client throws on msg type 1 — it never reads this
+        message. The e-RIC format may differ from standard RFB. We log
+        the raw header bytes to verify the format.
         """
-        await self._read_byte()  # padding
-        first_colour = await self._read_u16()
-        num_colours = await self._read_u16()
-        data = await self._read_exactly(num_colours * 6)
+        # Read the 5-byte header and log raw values for diagnostics
+        header = await self._read_exactly(5)
+        padding = header[0]
+        first_colour = (header[1] << 8) | header[2]
+        num_colours = (header[3] << 8) | header[4]
+        body_len = num_colours * 6
+
+        logger.debug("SetColourMapEntries: padding=0x%02x first=%d count=%d "
+                     "body_len=%d header=%s",
+                     padding, first_colour, num_colours, body_len,
+                     header.hex(' '))
+
+        # Sanity check — if values look wrong, the format may differ
+        if num_colours > 256 or first_colour > 255:
+            logger.warning("SetColourMapEntries: suspicious values "
+                           "first=%d count=%d — possible format mismatch, "
+                           "next bytes: %s",
+                           first_colour, num_colours,
+                           (await self._read_exactly(min(16, body_len))).hex(' ')
+                           if body_len > 0 else "")
+            return
+
+        data = await self._read_exactly(body_len)
+
+        # Peek at next byte in stream buffer for alignment check
+        if hasattr(self.reader, '_buffer') and len(self.reader._buffer) > 0:
+            next_byte = self.reader._buffer[0]
+            logger.debug("  next msg byte after colourmap: 0x%02x", next_byte)
 
         # Update the colour map with the new entries
         for i in range(num_colours):
@@ -1022,16 +1085,13 @@ class ERICProtocol:
             if idx < 256:
                 self._colourmap[idx] = (r, g, b)
 
-        # Apply the colour map to the framebuffer so pixel values are
-        # rendered using the server's actual palette (VGA text-mode colours).
-        # The server sends palette indices, not direct RGB332 values.
-        if self._colourmap != self.fb._colourmap:
+        # Apply the colour map to the framebuffer rendering.
+        colourmap_changed = self._colourmap != self.fb._colourmap
+        if colourmap_changed or not self._colourmap_applied:
             self.fb.set_colourmap(self._colourmap)
-            # Request a full refresh so tight-rendered areas get re-sent
-            # with the correct palette interpretation
-            await self.send_fb_update_request(incremental=False)
-        logger.debug("SetColourMapEntries: first=%d count=%d (applied)",
-                     first_colour, num_colours)
+            if not self._colourmap_applied:
+                logger.info("Colour map applied (%d entries)", num_colours)
+            self._colourmap_applied = True
 
     async def _handle_desktop_resize(self):
         """Handle desktop size change (type 0x80)."""
@@ -1047,9 +1107,12 @@ class ERICProtocol:
             self.on_resize(self.width, self.height)
 
     async def _handle_server_status(self):
-        """Handle server status message (type 0x83)."""
+        """Handle server status message (type 0x83).
+
+        Java ap.d(): 3 padding bytes + readInt (4 bytes) + data.
+        """
         await self._read_exactly(3)  # padding
-        length = await self._read_compact_len()
+        length = await self._read_u32()
         data = await self._read_exactly(length)
         msg = data.decode("iso-8859-1", errors="replace")
         logger.info("Server status: %s", msg)
@@ -1100,14 +1163,16 @@ class ERICProtocol:
     async def _handle_extended_info(self):
         """Handle extended info (type 0x08): video settings from KVM.
 
-        The 12 uint16 fields map to the VideoSettings struct (from j.java).
+        Java ap.e(): 1 padding + 4 bytes (brightness, contrast, contrast_green,
+        contrast_blue) + 8 uint16s (clock, phase, h/v_offset, h/v_resolution,
+        refresh_rate, v_offset_max) = 21 bytes total.
         """
         await self._read_byte()  # padding
         vs = self.video_settings
-        vs.brightness = await self._read_u16()
-        vs.contrast = await self._read_u16()
-        vs.contrast_green = await self._read_u16()
-        vs.contrast_blue = await self._read_u16()
+        vs.brightness = await self._read_byte()
+        vs.contrast = await self._read_byte()
+        vs.contrast_green = await self._read_byte()
+        vs.contrast_blue = await self._read_byte()
         vs.clock = await self._read_u16()
         vs.phase = await self._read_u16()
         vs.h_offset = await self._read_u16()
