@@ -52,6 +52,10 @@ def make_bridge(connected=True):
 
     bridge.kvm = kvm
 
+    kvm_config = MagicMock()
+    kvm_config.host = "test-kvm.local"
+    bridge.kvm_config = kvm_config
+
     vnc = MagicMock()
     vnc._clients = []
     bridge.vnc = vnc
@@ -76,7 +80,7 @@ class TestControlAPIRouting(unittest.TestCase):
         status, body, ct = self._route("GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("text/html", ct)
-        self.assertIn("IP-KVM Control Panel", body)
+        self.assertIn("vnc2ipkvm", body)
         self.assertIn("<html", body)
         self.assertIn("</html>", body)
 
@@ -470,7 +474,8 @@ class TestWebUIContent(unittest.TestCase):
 
     def test_has_title(self):
         html = self._get_html()
-        self.assertIn("<title>IP-KVM Control Panel</title>", html)
+        self.assertIn("<title", html)
+        self.assertIn("vnc2ipkvm", html)
 
     def test_has_status_bar(self):
         html = self._get_html()
@@ -615,7 +620,7 @@ class TestControlAPIHTTPIntegration(unittest.TestCase):
         resp = self._request("GET", "/")
         code, body = self._parse_response(resp)
         self.assertEqual(code, 200)
-        self.assertIn(b"IP-KVM Control Panel", body)
+        self.assertIn(b"vnc2ipkvm", body)
 
     def test_post_video_setting(self):
         resp = self._request("POST", "/video/brightness/100")

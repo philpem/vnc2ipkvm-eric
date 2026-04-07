@@ -330,6 +330,7 @@ class ControlAPI:
         vs = kvm.video_settings
         return (200, {
             "connected": kvm.connected,
+            "kvm_host": self.bridge.kvm_config.host,
             "server_name": kvm.server_name,
             "protocol_version": f"{kvm.server_version_major}.{kvm.server_version_minor:02d}",
             "framebuffer": {
@@ -565,7 +566,7 @@ _WEB_UI_HTML = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IP-KVM Control Panel</title>
+<title id="page-title">vnc2ipkvm</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   body { font-family: system-ui, -apple-system, sans-serif; margin: 0;
@@ -635,7 +636,7 @@ _WEB_UI_HTML = """\
 <body>
 <div class="container">
 
-<h1>IP-KVM Control Panel <small>vnc2ipkvm</small></h1>
+<h1>vnc2ipkvm <small id="kvm-host"></small></h1>
 
 <div class="status-bar" id="status-bar">
   <span><span class="dot off" id="dot"></span> <span id="conn-status">Checking...</span></span>
@@ -851,6 +852,10 @@ function applyStatus(s) {
     conn.textContent = 'Disconnected';
   }
   document.getElementById('srv-name').textContent = s.server_name || '';
+  if (s.kvm_host) {
+    document.getElementById('kvm-host').textContent = s.kvm_host;
+    document.title = 'vnc2ipkvm — ' + s.kvm_host;
+  }
   const fb = s.framebuffer || {};
   const vs = s.video_settings || {};
   document.getElementById('resolution').textContent =
