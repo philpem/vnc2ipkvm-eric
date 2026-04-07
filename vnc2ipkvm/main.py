@@ -313,8 +313,13 @@ Examples:
     parser.add_argument("--layout", default="en_US",
                         choices=AVAILABLE_LAYOUTS,
                         help="Keyboard layout (default: en_US)")
-    parser.add_argument("--encodings", default="255,7,-250",
-                        help="Comma-separated encoding list (default: 255,7,-250)")
+    parser.add_argument("--encodings", default="default",
+                        help="Encoding preset or comma-separated list. "
+                             "Presets: default (255,7,-250), "
+                             "compressed (7,-252), "
+                             "corre (5), "
+                             "tight (7,-250,9). "
+                             "Default: default")
 
     parser.add_argument("-v", "--verbose", action="count", default=0,
                         help="Increase verbosity (-v info, -vv debug)")
@@ -417,7 +422,23 @@ def main():
     if 'hotkeys' not in dir():
         hotkeys = []  # manual --applet-id mode, no hotkeys from params
 
-    encodings = [int(x.strip()) for x in args.encodings.split(",")]
+    ENCODING_PRESETS = {
+        "default":    [255, 7, -250],
+        "compressed": [7, -252],
+        "corre":      [5],
+        "tight":      [7, -250, 9],
+    }
+    preset = args.encodings.strip().lower()
+    if preset in ENCODING_PRESETS:
+        encodings = ENCODING_PRESETS[preset]
+    else:
+        try:
+            encodings = [int(x.strip()) for x in args.encodings.split(",")]
+        except ValueError:
+            print(f"Error: invalid --encodings value: {args.encodings!r}", file=sys.stderr)
+            print(f"Use a preset ({', '.join(ENCODING_PRESETS)}) or comma-separated integers.",
+                  file=sys.stderr)
+            sys.exit(1)
 
     config = KVMConfig(
         host=args.host,
