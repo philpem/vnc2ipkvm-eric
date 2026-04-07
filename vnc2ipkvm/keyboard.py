@@ -26,7 +26,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-RELEASE_FLAG = 0x80
+PRESS_FLAG = 0x80
 
 # Available layout names (for CLI help / validation)
 AVAILABLE_LAYOUTS = [
@@ -449,9 +449,9 @@ def keysym_to_scancode(keysym: int) -> int | None:
 def make_key_event(scancode: int, pressed: bool) -> bytes:
     """Create a 2-byte e-RIC key event message.
 
-    Wire format: [0x04, scancode] for press, [0x04, scancode|0x80] for release.
+    Wire format: [0x04, scancode|0x80] for press, [0x04, scancode] for release.
     """
-    code = scancode if pressed else (scancode | RELEASE_FLAG)
+    code = (scancode | PRESS_FLAG) if pressed else scancode
     return bytes([0x04, code & 0xFF])
 
 
@@ -497,3 +497,203 @@ class ModifierTracker:
     def is_modifier_held(self) -> bool:
         """Return True if any modifier is currently held."""
         return bool(self._held & MODIFIER_SCANCODES)
+
+
+# ---------------------------------------------------------------------------
+# Human-readable key name -> scan code mapping
+# Matches the Belkin KVM hotkey syntax (case-insensitive)
+# ---------------------------------------------------------------------------
+
+KEY_NAMES: dict[str, int] = {}
+
+def _init_key_names():
+    """Build the KEY_NAMES lookup from existing scan code tables."""
+    # Letters A-Z
+    for ch in range(ord('A'), ord('Z') + 1):
+        KEY_NAMES[chr(ch)] = _CHARS_EN_US[ch]
+    # Digits 0-9
+    for ch in range(ord('0'), ord('9') + 1):
+        KEY_NAMES[chr(ch)] = _CHARS_EN_US[ch]
+
+    # Named keys matching KVM documentation
+    KEY_NAMES.update({
+        # Punctuation / symbols
+        "TILDE": 0, "~": 0,
+        "MINUS": 11,
+        "EQUALS": 12, "=": 12,
+        ";": 38, "'": 39,
+        "LESS": 50, "<": 50,
+        ",": 50, ".": 51,
+        "SLASH": 52, "/": 52,
+        "[": 25, "]": 26,
+        "BACK_SLASH": 40, "\\": 40,
+
+        # Control keys
+        "BACK_SPACE": 13, "BACKSPACE": 13,
+        "TAB": 14,
+        "ENTER": 27, "RETURN": 27,
+        "CAPS_LOCK": 28, "CAPSLOCK": 28,
+        "SPACE": 56,
+        "ESCAPE": 59, "ESC": 59,
+
+        # Modifiers
+        "LSHIFT": 41, "SHIFT": 41,
+        "RSHIFT": 53,
+        "LCTRL": 54, "CTRL": 54,
+        "RCTRL": 58,
+        "LALT": 55, "ALT": 55,
+        "ALTGR": 57, "RALT": 57,
+
+        # Function keys
+        "F1": 60, "F2": 61, "F3": 62, "F4": 63,
+        "F5": 64, "F6": 65, "F7": 66, "F8": 67,
+        "F9": 68, "F10": 69, "F11": 70, "F12": 71,
+
+        # Print/Lock/Pause
+        "PRINTSCREEN": 72, "PRINT": 72, "SYSRQ": 72,
+        "SCROLL_LOCK": 73, "SCROLLLOCK": 73,
+        "BREAK": 74, "PAUSE": 74,
+
+        # Navigation
+        "INSERT": 75, "HOME": 76, "PAGE_UP": 77, "PAGEUP": 77,
+        "DELETE": 78, "DEL": 78,
+        "END": 79,
+        "PAGE_DOWN": 80, "PAGEDOWN": 80,
+
+        # Arrows
+        "UP": 81, "LEFT": 82, "DOWN": 83, "RIGHT": 84,
+
+        # Lock keys
+        "NUM_LOCK": 85, "NUMLOCK": 85,
+
+        # Numpad
+        "NUMPAD0": 100, "NUMPAD1": 95, "NUMPAD2": 96, "NUMPAD3": 97,
+        "NUMPAD4": 91, "NUMPAD5": 92, "NUMPAD6": 93, "NUMPAD7": 86,
+        "NUMPAD8": 87, "NUMPAD9": 88,
+        "NUMPADPLUS": 89, "NUMPAD_PLUS": 89,
+        "NUMPADMINUS": 99, "NUMPAD_MINUS": 99,
+        "NUMPADMUL": 94, "NUMPAD_MUL": 94,
+        "NUMPAD/": 90, "NUMPAD_DIV": 90,
+        "NUMPADENTER": 27,  # same scan code as Enter
+        "NUMPAD.": 101, "NUMPAD_DECIMAL": 101,
+
+        # Windows/Menu
+        "WINDOWS": 87, "WIN": 87, "SUPER": 87,
+        "MENU": 105,
+    })
+
+_init_key_names()
+
+
+def key_name_to_scancode(name: str) -> int | None:
+    """Look up a key name (case-insensitive) and return its scan code, or None."""
+    return KEY_NAMES.get(name.upper().strip())
+
+
+def parse_hotkey_expression(expr: str) -> list[tuple[str, int | None]]:
+    """Parse a KVM-style hotkey expression into a sequence of actions.
+
+    Syntax:  keycode [+|-[*] keycode]*
+      +  builds key combinations (all pressed, released in reverse at - or end)
+      -  separates independent key press-release actions
+      *  inserts a pause
+
+    Returns a list of (action, scancode) tuples:
+      ("press", sc)   - press the key
+      ("release", sc) - release the key
+      ("pause", None) - insert a pause
+
+    Raises ValueError if a key name is not recognised.
+    """
+    expr = expr.strip()
+    if not expr:
+        return []
+
+    actions: list[tuple[str, int | None]] = []
+    held: list[int] = []  # stack of currently held keys
+
+    # Tokenise: split on + and - while preserving delimiters, handle *
+    # We parse character by character to handle *, +, - correctly
+    tokens: list[str] = []
+    current = ""
+    for ch in expr:
+        if ch in ('+', '-'):
+            if current.strip():
+                tokens.append(current.strip())
+            tokens.append(ch)
+            current = ""
+        elif ch == '*':
+            if current.strip():
+                tokens.append(current.strip())
+            tokens.append('*')
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        tokens.append(current.strip())
+
+    for i, tok in enumerate(tokens):
+        if tok == '*':
+            actions.append(("pause", None))
+            continue
+        if tok == '+':
+            # Next key adds to the combination (held keys stay pressed)
+            continue
+        if tok == '-':
+            # Release all held keys in reverse order
+            for sc in reversed(held):
+                actions.append(("release", sc))
+            held.clear()
+            continue
+
+        # It's a key name — resolve it
+        sc = key_name_to_scancode(tok)
+        if sc is None:
+            raise ValueError(f"Unknown key: {tok!r}")
+        held.append(sc)
+        actions.append(("press", sc))
+
+    # Release any remaining held keys
+    for sc in reversed(held):
+        actions.append(("release", sc))
+
+    return actions
+
+
+def hotkey_to_hex_codes(expr: str) -> str:
+    """Convert a KVM-style hotkey expression to hex scan code sequence.
+
+    This produces the same format as HOTKEYCODE_n from the applet params,
+    compatible with _send_scancode_sequence() in control_api.py.
+
+    Examples:
+        "Ctrl+Alt+Delete"  -> "36 37 4e f1"
+        "A-B-C"            -> "1d f1 2f f1 2d f1"
+        "Ctrl+A*-B"        -> "36 1d f2 f1 2f f1"
+    """
+    actions = parse_hotkey_expression(expr)
+    codes = []
+    for action, sc in actions:
+        if action == "press":
+            codes.append(f"{sc:02x}")
+        elif action == "release":
+            # Use F1 (release-all) after each group for simplicity,
+            # but only emit it once per release batch
+            pass  # handled below
+        elif action == "pause":
+            codes.append("f2")
+
+    # Actually, let's build it differently — use the action list directly
+    # to produce the right hex sequence with F1 markers
+    codes = []
+    for action, sc in actions:
+        if action == "press":
+            codes.append(f"{sc:02x}")
+        elif action == "release":
+            # We'll batch releases: after a sequence of releases, emit f1
+            if not codes or codes[-1] != "f1":
+                codes.append("f1")
+        elif action == "pause":
+            codes.append("f2")
+
+    return " ".join(codes)

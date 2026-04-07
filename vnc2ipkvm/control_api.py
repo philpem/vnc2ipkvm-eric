@@ -52,6 +52,15 @@ VIDEO_SETTINGS = {
     "v-offset":        (7, 0, 128),
 }
 
+def _is_hex_byte(s: str) -> bool:
+    """Return True if s is a valid 1-2 digit hex value 00-FF."""
+    try:
+        v = int(s, 16)
+        return 0 <= v <= 255 and len(s) <= 2
+    except ValueError:
+        return False
+
+
 VIDEO_ACTIONS = {
     "reset-all":   (8, 0),
     "reset-mode":  (9, 0),
@@ -69,6 +78,7 @@ class ControlAPI:
         self.listen_host = listen_host
         self.listen_port = listen_port
         self._server: asyncio.Server | None = None
+        self._sse_clients: set[asyncio.StreamWriter] = set()
 
     async def start(self):
         self._server = await asyncio.start_server(
@@ -77,9 +87,76 @@ class ControlAPI:
         logger.info("Control API listening on http://%s:%d/", addr[0], addr[1])
 
     async def stop(self):
+        # Close all SSE clients
+        for writer in list(self._sse_clients):
+            try:
+                writer.close()
+            except Exception:
+                pass
+        self._sse_clients.clear()
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+
+    def notify_clients(self):
+        """Push current status to all SSE clients. Call from bridge on state changes."""
+        if not self._sse_clients:
+            return
+        status = self._get_status()
+        data = json.dumps(status[1], separators=(",", ":"))
+        sse_msg = f"data: {data}\n\n"
+        sse_bytes = sse_msg.encode("utf-8")
+        dead = []
+        for writer in self._sse_clients:
+            try:
+                writer.write(sse_bytes)
+                # Schedule drain so buffered data actually gets sent
+                asyncio.ensure_future(self._drain_writer(writer))
+            except Exception:
+                dead.append(writer)
+        for w in dead:
+            self._sse_clients.discard(w)
+
+    @staticmethod
+    async def _drain_writer(writer: asyncio.StreamWriter):
+        try:
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+
+    async def _handle_sse(self, reader: asyncio.StreamReader,
+                           writer: asyncio.StreamWriter):
+        """Handle an SSE connection: send headers, initial status, then keep alive."""
+        header = (
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/event-stream\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+        )
+        writer.write(header.encode("utf-8"))
+        # Send initial status immediately
+        status = self._get_status()
+        data = json.dumps(status[1], separators=(",", ":"))
+        writer.write(f"data: {data}\n\n".encode("utf-8"))
+        await writer.drain()
+        self._sse_clients.add(writer)
+        try:
+            # Keep connection open until client disconnects
+            while True:
+                chunk = await reader.read(1024)
+                if not chunk:
+                    break
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            self._sse_clients.discard(writer)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):
@@ -98,6 +175,16 @@ class ControlAPI:
 
             method = parts[0].upper()
             path = unquote(parts[1])
+
+            # SSE endpoint — hand off before reading body
+            if path.rstrip("/") == "/events" and method == "GET":
+                # Consume remaining headers
+                while True:
+                    line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+                await self._handle_sse(reader, writer)
+                return
 
             # Read headers
             content_length = 0
@@ -120,6 +207,10 @@ class ControlAPI:
                 await self._send_response(writer, result[0], result[1], result[2])
             else:
                 await self._send_response(writer, result[0], result[1])
+
+            # Push updated status to SSE clients after any successful POST
+            if method == "POST" and result[0] == 200:
+                self.notify_clients()
 
         except (asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError):
             pass
@@ -274,6 +365,7 @@ class ControlAPI:
         return (200, {
             "endpoints": {
                 "GET /status": "Current KVM status and video settings",
+                "GET /events": "Server-Sent Events stream of status updates",
                 "GET /help": "This help message",
                 "POST /video/<setting>/<value>": f"Adjust video: {', '.join(VIDEO_SETTINGS.keys())}",
                 "POST /video/auto-adjust": "Auto-adjust video settings",
@@ -285,7 +377,7 @@ class ControlAPI:
                 "POST /exclusive/on|off": "Enable/disable exclusive access",
                 "POST /keyboard/release-all": "Release all held modifier keys",
                 "POST /keyboard/type": "Type a string (send in request body)",
-                "POST /keyboard/send": "Send hex scan codes (e.g. '36 f0 37 f0 4e' for Ctrl+Alt+Del)",
+                "POST /keyboard/send": "Send key expression (e.g. 'Ctrl+Alt+Delete') or hex scan codes",
                 "POST /hotkey/<n>": "Send hotkey n (from KVM configuration)",
                 "POST /rdp/on": "Enter Remote Desktop mode",
                 "POST /host-direct/on": "Enter Host Acceleration mode",
@@ -417,22 +509,50 @@ class ControlAPI:
                       "index": index, "label": hotkey["label"], "keys_sent": sent})
 
     async def _handle_send_scancodes(self, body: bytes, kvm) -> tuple[int, dict]:
-        """Send a raw scan code sequence from the request body."""
+        """Send key sequence from the request body.
+
+        Accepts either:
+          - KVM-style hotkey expression: "Ctrl+Alt+Delete", "A-B-C"
+          - Raw hex scan codes: "36 37 4e f1"
+        Auto-detects format: if all tokens are valid hex bytes, treat as hex.
+        """
         text = body.decode("utf-8", errors="replace").strip()
         if not text:
-            return (400, {"error": "provide hex scan codes in request body"})
+            return (400, {"error": "provide key expression or hex scan codes"})
 
-        # Validate all tokens are valid hex
-        for token in text.split():
-            try:
-                val = int(token, 16)
-                if val < 0 or val > 255:
-                    return (400, {"error": f"value '{token}' out of range (00-FF)"})
-            except ValueError:
-                return (400, {"error": f"invalid hex code: '{token}'"})
+        # Auto-detect: if all space-separated tokens are valid hex 00-FF, use hex mode
+        tokens = text.split()
+        is_hex = all(_is_hex_byte(t) for t in tokens)
 
-        sent = await self._send_scancode_sequence(text, kvm)
-        return (200, {"ok": True, "action": "send", "keys_sent": sent})
+        if is_hex:
+            sent = await self._send_scancode_sequence(text, kvm)
+            return (200, {"ok": True, "action": "send", "format": "hex", "keys_sent": sent})
+
+        # Otherwise parse as hotkey expression
+        return await self._execute_hotkey_expression(text, kvm)
+
+    async def _execute_hotkey_expression(self, expr: str, kvm) -> tuple[int, dict]:
+        """Execute a KVM-style hotkey expression like 'Ctrl+Alt+Delete'."""
+        from vnc2ipkvm.keyboard import parse_hotkey_expression
+        try:
+            actions = parse_hotkey_expression(expr)
+        except ValueError as e:
+            return (400, {"error": str(e)})
+
+        sent = 0
+        for action, sc in actions:
+            if action == "press":
+                await kvm.send_key_event(sc, True)
+                sent += 1
+                await asyncio.sleep(0.02)
+            elif action == "release":
+                await kvm.send_key_event(sc, False)
+                await asyncio.sleep(0.02)
+            elif action == "pause":
+                await asyncio.sleep(0.1)
+
+        return (200, {"ok": True, "action": "send", "format": "expression",
+                      "expression": expr, "keys_sent": sent})
 
 
 # ---------------------------------------------------------------------------
@@ -495,7 +615,8 @@ _WEB_UI_HTML = """\
 
   .kvm-banner { background: #1e40af; color: #fff; text-align: center;
                 padding: 8px 12px; border-radius: 6px; margin-bottom: 12px;
-                font-size: 0.9em; display: none; }
+                font-size: 0.9em; font-family: monospace; white-space: pre;
+                display: none; }
   .kvm-banner.visible { display: block; }
 
   .toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 18px;
@@ -586,24 +707,31 @@ _WEB_UI_HTML = """\
     <button class="btn primary" onclick="typeText()">Send</button>
   </div>
   <div class="form-row">
-    <label>Send codes:</label>
-    <input type="text" id="send-codes" placeholder="e.g. 36 f0 37 f0 4e">
+    <label>Send keys:</label>
+    <input type="text" id="send-codes" placeholder="e.g. Ctrl+Alt+Delete">
     <button class="btn primary" onclick="sendCodes()">Send</button>
   </div>
   <div class="btn-row" style="margin-top:8px">
     <button class="btn" onclick="postAction('/keyboard/release-all')">Release All Keys</button>
   </div>
   <details style="margin-top:10px;font-size:0.8em;color:#aaa">
-    <summary style="cursor:pointer;color:#93c5fd">Scan code reference</summary>
+    <summary style="cursor:pointer;color:#93c5fd">Key expression syntax</summary>
     <div style="margin-top:6px;line-height:1.6">
-      <b>Modifiers:</b> 29=LShift, 35=RShift, 36=LCtrl, 3A=RCtrl, 37=LAlt, 39=RAlt/AltGr<br>
-      <b>F-keys:</b> 3C=F1, 3D=F2, 3E=F3, 3F=F4, 40=F5, 41=F6, 42=F7, 43=F8, 44=F9, 45=F10, 46=F11, 47=F12<br>
-      <b>Navigation:</b> 4B=Insert, 4E=Delete, 4C=Home, 4F=End, 4D=PgUp, 50=PgDn<br>
-      <b>Arrows:</b> 51=Up, 52=Left, 53=Down, 54=Right<br>
-      <b>Control:</b> 1B=Enter, 3B=Escape, 0E=Tab, 0D=Backspace, 38=Space, 1C=CapsLock<br>
-      <b>Other:</b> 48=PrintScr, 4A=Pause, 55=NumLock, 49=ScrollLock<br>
-      <b>Special:</b> F0=separator(skip), F1=release all, F2=pause(100ms), F3=release last<br>
-      <b>Example:</b> <code>36 f0 37 f0 4e</code> = Ctrl+Alt+Delete
+      <b>Syntax:</b> <code>key [+ key]* [- key [+ key]*]*</code><br>
+      <b>+</b> builds combinations (all held, released in reverse at <b>-</b> or end)<br>
+      <b>-</b> separates independent keypress groups<br>
+      <b>*</b> inserts a pause<br>
+      <b>Examples:</b> <code>Ctrl+Alt+Delete</code> &nbsp; <code>Alt+F4</code> &nbsp; <code>A-B-C</code> (types A, B, C separately)<br>
+      <b>Letters/digits:</b> A-Z, 0-9<br>
+      <b>Modifiers:</b> Ctrl, Shift, Alt, AltGr, RCtrl, RShift<br>
+      <b>F-keys:</b> F1-F12<br>
+      <b>Navigation:</b> Insert, Delete, Home, End, Page_Up, Page_Down<br>
+      <b>Arrows:</b> Up, Down, Left, Right<br>
+      <b>Control:</b> Enter, Escape (Esc), Tab, Back_Space, Space, Caps_Lock<br>
+      <b>Other:</b> PrintScreen, Scroll_Lock, Pause, Num_Lock, Windows, Menu<br>
+      <b>Numpad:</b> Numpad0-Numpad9, NumpadPlus, NumpadMinus, NumpadMul, Numpad/, NumpadEnter<br>
+      <b>Symbols:</b> ~ - = ; ' &lt; , . / [ ] \\<br>
+      <b>Raw hex:</b> also accepts hex scan codes: <code>36 37 4e f1</code>
     </div>
   </details>
 </div>
@@ -712,68 +840,68 @@ function toast(msg, type) {
   el._timer = setTimeout(() => el.classList.add('hidden'), 3000);
 }
 
+function applyStatus(s) {
+  const dot = document.getElementById('dot');
+  const conn = document.getElementById('conn-status');
+  if (s.connected) {
+    dot.className = 'dot on';
+    conn.textContent = 'Connected';
+  } else {
+    dot.className = 'dot off';
+    conn.textContent = 'Disconnected';
+  }
+  document.getElementById('srv-name').textContent = s.server_name || '';
+  const fb = s.framebuffer || {};
+  const vs = s.video_settings || {};
+  document.getElementById('resolution').textContent =
+    (vs.resolution || (fb.width + 'x' + fb.height)) +
+    (vs.refresh_rate ? ' @' + vs.refresh_rate + 'Hz' : '');
+  document.getElementById('vnc-clients').textContent =
+    (s.vnc_clients || 0) + ' VNC client' + (s.vnc_clients !== 1 ? 's' : '');
+
+  if (s.hotkeys) buildHotkeys(s.hotkeys);
+
+  const banner = document.getElementById('kvm-banner');
+  if (banner) {
+    if (s.server_message) {
+      banner.textContent = s.server_message;
+      banner.className = 'kvm-banner visible';
+    } else {
+      banner.className = 'kvm-banner';
+    }
+  }
+
+  const portEl = document.getElementById('kvm-port-display');
+  if (portEl) portEl.textContent = s.kvm_port != null ? s.kvm_port : '—';
+
+  const rdpEl = document.getElementById('rdp-state');
+  if (rdpEl) rdpEl.textContent = s.rdp_mode ? 'Active' :
+    (s.rdp_available === false ? 'Unavailable' : 'Off');
+  const hdEl = document.getElementById('hd-state');
+  if (hdEl) hdEl.textContent = s.host_direct_mode ? 'Active' : 'Off';
+  const exclEl = document.getElementById('excl-state');
+  if (exclEl) exclEl.textContent = s.exclusive_mode === true ? 'On' :
+    (s.exclusive_mode === false ? 'Off' : '—');
+  const userEl = document.getElementById('user-count');
+  if (userEl) userEl.textContent = s.connected_users != null ? s.connected_users : '—';
+
+  SLIDERS.forEach(sl => {
+    const val = vs[sl.key];
+    if (val !== undefined) {
+      const slider = document.getElementById('sl-' + sl.name);
+      const spin = document.getElementById('sv-' + sl.name);
+      if (slider && document.activeElement !== slider) slider.value = val;
+      if (spin && document.activeElement !== spin) spin.value = val;
+    }
+  });
+}
+
 async function refreshStatus() {
-  if (Date.now() < pauseRefreshUntil) return;  // skip during slider interaction
+  if (Date.now() < pauseRefreshUntil) return;
   try {
     const r = await fetch(API + '/status');
     const s = await r.json();
-    const dot = document.getElementById('dot');
-    const conn = document.getElementById('conn-status');
-    if (s.connected) {
-      dot.className = 'dot on';
-      conn.textContent = 'Connected';
-    } else {
-      dot.className = 'dot off';
-      conn.textContent = 'Disconnected';
-    }
-    document.getElementById('srv-name').textContent = s.server_name || '';
-    const fb = s.framebuffer || {};
-    const vs = s.video_settings || {};
-    document.getElementById('resolution').textContent =
-      (vs.resolution || (fb.width + 'x' + fb.height)) +
-      (vs.refresh_rate ? ' @' + vs.refresh_rate + 'Hz' : '');
-    document.getElementById('vnc-clients').textContent =
-      (s.vnc_clients || 0) + ' VNC client' + (s.vnc_clients !== 1 ? 's' : '');
-
-    // Build hotkey buttons once
-    if (s.hotkeys) buildHotkeys(s.hotkeys);
-
-    // KVM status banner
-    const banner = document.getElementById('kvm-banner');
-    if (banner) {
-      if (s.server_message) {
-        banner.textContent = s.server_message;
-        banner.className = 'kvm-banner visible';
-      } else {
-        banner.className = 'kvm-banner';
-      }
-    }
-
-    const portEl = document.getElementById('kvm-port-display');
-    if (portEl) portEl.textContent = s.kvm_port != null ? s.kvm_port : '—';
-
-    // Mode & status
-    const rdpEl = document.getElementById('rdp-state');
-    if (rdpEl) rdpEl.textContent = s.rdp_mode ? 'Active' :
-      (s.rdp_available === false ? 'Unavailable' : 'Off');
-    const hdEl = document.getElementById('hd-state');
-    if (hdEl) hdEl.textContent = s.host_direct_mode ? 'Active' : 'Off';
-    const exclEl = document.getElementById('excl-state');
-    if (exclEl) exclEl.textContent = s.exclusive_mode === true ? 'On' :
-      (s.exclusive_mode === false ? 'Off' : '—');
-    const userEl = document.getElementById('user-count');
-    if (userEl) userEl.textContent = s.connected_users != null ? s.connected_users : '—';
-
-    // Update sliders and spin inputs to match server values
-    SLIDERS.forEach(sl => {
-      const val = vs[sl.key];
-      if (val !== undefined) {
-        const slider = document.getElementById('sl-' + sl.name);
-        const spin = document.getElementById('sv-' + sl.name);
-        if (slider && document.activeElement !== slider) slider.value = val;
-        if (spin && document.activeElement !== spin) spin.value = val;
-      }
-    });
+    applyStatus(s);
   } catch (e) {
     document.getElementById('dot').className = 'dot off';
     document.getElementById('conn-status').textContent = 'API unreachable';
@@ -819,7 +947,34 @@ function buildHotkeys(hotkeys) {
 
 buildSliders();
 refreshStatus();
-setInterval(refreshStatus, 3000);
+
+// SSE for real-time updates, falling back to polling
+let sseActive = false;
+let pollTimer = setInterval(refreshStatus, 1000);  // start with 1s polling
+
+function connectSSE() {
+  const es = new EventSource(API + '/events');
+  es.onopen = () => {
+    sseActive = true;
+    // Slow down polling when SSE is working
+    clearInterval(pollTimer);
+    pollTimer = setInterval(refreshStatus, 10000);
+  };
+  es.onmessage = (e) => {
+    if (Date.now() < pauseRefreshUntil) return;
+    try { applyStatus(JSON.parse(e.data)); } catch(err) {}
+  };
+  es.onerror = () => {
+    if (sseActive) {
+      // Was working, now lost — speed up polling
+      sseActive = false;
+      clearInterval(pollTimer);
+      pollTimer = setInterval(refreshStatus, 1000);
+    }
+    // Let EventSource auto-reconnect (don't close it)
+  };
+}
+connectSSE();
 </script>
 </body>
 </html>

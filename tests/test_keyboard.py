@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from vnc2ipkvm.keyboard import (
     build_keymap, KeyboardTranslator, ModifierTracker,
     get_translator, keysym_to_scancode, make_key_event,
-    AVAILABLE_LAYOUTS, MODIFIER_SCANCODES, RELEASE_FLAG,
+    AVAILABLE_LAYOUTS, MODIFIER_SCANCODES, PRESS_FLAG,
     _SPECIAL_KEYS, _CHARS_EN_US,
 )
 
@@ -130,14 +130,14 @@ class TestMakeKeyEvent(unittest.TestCase):
 
     def test_press(self):
         result = make_key_event(29, True)
-        self.assertEqual(result, bytes([0x04, 29]))
+        self.assertEqual(result, bytes([0x04, 29 | 0x80]))
 
     def test_release(self):
         result = make_key_event(29, False)
-        self.assertEqual(result, bytes([0x04, 29 | 0x80]))
+        self.assertEqual(result, bytes([0x04, 29]))
 
-    def test_release_flag_value(self):
-        self.assertEqual(RELEASE_FLAG, 0x80)
+    def test_press_flag_value(self):
+        self.assertEqual(PRESS_FLAG, 0x80)
 
     def test_key_event_masks_byte(self):
         result = make_key_event(0x1FF, True)

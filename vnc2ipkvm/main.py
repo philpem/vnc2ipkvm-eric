@@ -90,15 +90,22 @@ class Bridge:
     def _on_kvm_resize(self, width: int, height: int):
         logger.info("KVM desktop resized to %dx%d", width, height)
         self.vnc.notify_resize(width, height)
+        self._notify_ui()
 
     def _on_kvm_clipboard(self, text: str):
         self.vnc.send_clipboard(text)
 
     def _on_kvm_disconnect(self):
         logger.warning("KVM connection lost")
+        self._notify_ui()
         if self.auto_reconnect and self._running:
             asyncio.get_event_loop().call_soon(
                 lambda: asyncio.ensure_future(self._reconnect_kvm()))
+
+    def _notify_ui(self):
+        """Push status to SSE clients if control API is active."""
+        if self.api:
+            self.api.notify_clients()
 
     def _on_kvm_command(self, key: str, value: str):
         """Handle server commands like exclusive_mode, rc_users, etc."""
@@ -117,15 +124,18 @@ class Bridge:
         elif key_lower == "rdp_enabled":
             self.kvm.rdp_available = (value.lower() == "yes")
             logger.info("RDP available: %s", value)
+        self._notify_ui()
 
     def _on_kvm_message(self, message: str, blackout: bool, duration_ms: int):
         """Handle KVM status messages (e.g. 'Please press Auto-Adjust')."""
+        self._notify_ui()
         if message and duration_ms > 0:
             # Auto-clear the message after the specified duration
             async def _clear():
                 await asyncio.sleep(duration_ms / 1000.0)
                 if self.kvm.server_message == message:
                     self.kvm.server_message = ""
+                    self._notify_ui()
             asyncio.ensure_future(_clear())
 
     # ---- VNC -> KVM callbacks ----
@@ -202,6 +212,7 @@ class Bridge:
             self.vnc.server_name = self.kvm.server_name or "Belkin IP-KVM"
             self._kvm_task = asyncio.create_task(self.kvm.run())
             logger.info("KVM connected and running")
+            self._notify_ui()
         except Exception as e:
             logger.error("Failed to connect to KVM: %s", e)
             if self.auto_reconnect:

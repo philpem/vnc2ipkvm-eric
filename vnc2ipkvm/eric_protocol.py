@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 from vnc2ipkvm.color import RGB332_TO_ARGB, RGB332_TO_RGB, PALETTE_2, PALETTE_4, PALETTE_16_GRAY, PALETTE_16_COLOR
 from vnc2ipkvm.framebuffer import Framebuffer
-from vnc2ipkvm.keyboard import keysym_to_scancode, make_key_event, RELEASE_FLAG
+from vnc2ipkvm.keyboard import keysym_to_scancode, make_key_event, PRESS_FLAG
 
 logger = logging.getLogger(__name__)
 

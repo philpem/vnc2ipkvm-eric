@@ -518,9 +518,11 @@ class TestWebUIContent(unittest.TestCase):
         self.assertIn("/host-direct/on", html)
         self.assertIn("Exclusive Access", html)
 
-    def test_has_auto_refresh(self):
+    def test_has_sse_and_fallback_refresh(self):
         html = self._get_html()
-        self.assertIn("setInterval(refreshStatus, 3000)", html)
+        self.assertIn("EventSource", html)
+        self.assertIn("connectSSE", html)
+        self.assertIn("refreshStatus", html)
 
     def test_has_slider_debounce(self):
         html = self._get_html()
