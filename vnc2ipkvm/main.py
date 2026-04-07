@@ -35,8 +35,10 @@ class Bridge:
                  vnc_port: int = 5900, auto_reconnect: bool = True,
                  keyboard_layout: str = "en_US",
                  api_host: str = "127.0.0.1", api_port: int = 6900,
-                 hotkeys: list | None = None):
+                 hotkeys: list | None = None,
+                 login_credentials: dict | None = None):
         self.kvm_config = kvm_config
+        self.login_credentials = login_credentials  # for session refresh on reconnect
         self.vnc_host = vnc_host
         self.vnc_port = vnc_port
         self.auto_reconnect = auto_reconnect
@@ -231,6 +233,18 @@ class Bridge:
 
         if not self._running:
             return
+
+        # Re-fetch session token if we have login credentials
+        if self.login_credentials:
+            try:
+                logger.info("Refreshing session token...")
+                loop = asyncio.get_event_loop()
+                params = await loop.run_in_executor(
+                    None, lambda: fetch_applet_params(**self.login_credentials))
+                self.kvm_config.applet_id = params["APPLET_ID"]
+                logger.info("New session ID: %s...", params["APPLET_ID"][:16])
+            except Exception as e:
+                logger.error("Failed to refresh session: %s", e)
 
         # Create a fresh protocol instance
         self.kvm = ERICProtocol(self.kvm_config, self.fb)
@@ -432,6 +446,16 @@ def main():
             if hotkeys:
                 print(f"  Hotkeys:   {', '.join(h['label'] for h in hotkeys)}")
 
+            # Save credentials for session refresh on reconnect
+            login_credentials = {
+                "host": args.host,
+                "port_id": port_id,
+                "username": args.user,
+                "password": args.password,
+                "use_https": False,
+                "http_port": args.http_port,
+            }
+
         except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
             print("Provide --applet-id manually, or --user/--password for login.",
@@ -440,6 +464,8 @@ def main():
 
     if 'hotkeys' not in dir():
         hotkeys = []  # manual --applet-id mode, no hotkeys from params
+    if 'login_credentials' not in dir():
+        login_credentials = None
 
     ENCODING_PRESETS = {
         "default":    [255, 7, -250],
@@ -485,6 +511,7 @@ def main():
         api_host=args.api_host,
         api_port=args.api_port,
         hotkeys=hotkeys,
+        login_credentials=login_credentials,
     )
 
     print(f"VNC-to-IPKVM Bridge")
