@@ -115,6 +115,8 @@ class ERICProtocol:
         self.rdp_available: bool | None = None
         self.connected_users: int | None = None
         self.current_port: int = config.port_id
+        self.server_message: str = ""       # Status/info message from KVM
+        self.server_message_blackout: bool = False  # True = black out screen behind message
 
         # Callbacks
         self.on_bell = None
@@ -123,6 +125,7 @@ class ERICProtocol:
         self.on_disconnect = None
         self.on_video_settings = None   # (VideoSettings)
         self.on_server_command = None   # (key: str, value: str)
+        self.on_server_message = None   # (message: str, blackout: bool, duration_ms: int)
 
     async def connect(self):
         """Connect to the KVM and perform the full handshake."""
@@ -1126,12 +1129,29 @@ class ERICProtocol:
             self.on_server_command(key, val)
 
     async def _handle_palette_update(self):
-        """Handle palette update (type 0x10)."""
-        has_palette = await self._read_byte()
-        session_id = await self._read_u16()
+        """Handle palette update (type 0x10).
+
+        This shares the same format as the handshake server info: 1 byte
+        hasPassword flag, 2 bytes sessionId (used as display duration in ms),
+        2 bytes info_length, then the info string.
+
+        The Java applet displays the info string as a 20px banner overlaid
+        on the framebuffer. If hasPassword is set, the screen behind is
+        blacked out. The banner auto-dismisses after sessionId milliseconds.
+        """
+        has_password = await self._read_byte()
+        duration_ms = await self._read_u16()
         data_len = await self._read_u16()
-        await self._read_exactly(data_len)
-        logger.debug("Palette update: has=%d session=%d len=%d", has_palette, session_id, data_len)
+        data = await self._read_exactly(data_len)
+        info = data.decode("iso-8859-1", errors="replace") if data_len > 0 else ""
+
+        self.server_message = info
+        self.server_message_blackout = (has_password == 1)
+        if info:
+            logger.info("KVM message: %s (duration=%dms, blackout=%s)",
+                        info, duration_ms, self.server_message_blackout)
+        if self.on_server_message:
+            self.on_server_message(info, has_password == 1, duration_ms)
 
     async def _handle_ping(self):
         """Handle ping (type 0x94) and send response.

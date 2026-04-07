@@ -48,6 +48,7 @@ def make_bridge(connected=True):
     kvm.rdp_available = None
     kvm.host_direct_mode = False
     kvm.connected_users = None
+    kvm.server_message = ""
 
     bridge.kvm = kvm
 

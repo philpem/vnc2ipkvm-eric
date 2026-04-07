@@ -72,6 +72,7 @@ class Bridge:
         self.kvm.on_clipboard = self._on_kvm_clipboard
         self.kvm.on_disconnect = self._on_kvm_disconnect
         self.kvm.on_server_command = self._on_kvm_command
+        self.kvm.on_server_message = self._on_kvm_message
 
         # VNC -> KVM
         self.vnc.on_key_event = self._on_vnc_key
@@ -114,6 +115,16 @@ class Bridge:
         elif key_lower == "rdp_enabled":
             self.kvm.rdp_available = (value.lower() == "yes")
             logger.info("RDP available: %s", value)
+
+    def _on_kvm_message(self, message: str, blackout: bool, duration_ms: int):
+        """Handle KVM status messages (e.g. 'Please press Auto-Adjust')."""
+        if message and duration_ms > 0:
+            # Auto-clear the message after the specified duration
+            async def _clear():
+                await asyncio.sleep(duration_ms / 1000.0)
+                if self.kvm.server_message == message:
+                    self.kvm.server_message = ""
+            asyncio.ensure_future(_clear())
 
     # ---- VNC -> KVM callbacks ----
 

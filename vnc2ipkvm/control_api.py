@@ -264,6 +264,7 @@ class ControlAPI:
             "rdp_available": kvm.rdp_available,
             "host_direct_mode": kvm.host_direct_mode,
             "connected_users": kvm.connected_users,
+            "server_message": kvm.server_message,
         })
 
     def _help(self) -> tuple[int, dict]:
@@ -413,6 +414,11 @@ _WEB_UI_HTML = """\
     border: 1px solid #334155; border-radius: 4px; color: #e0e0e0;
     font-size: 0.85em; }
 
+  .kvm-banner { background: #1e40af; color: #fff; text-align: center;
+                padding: 8px 12px; border-radius: 6px; margin-bottom: 12px;
+                font-size: 0.9em; display: none; }
+  .kvm-banner.visible { display: block; }
+
   .toast { position: fixed; bottom: 20px; right: 20px; padding: 10px 18px;
            border-radius: 6px; font-size: 0.85em; z-index: 999;
            transition: opacity 0.3s; }
@@ -438,6 +444,8 @@ _WEB_UI_HTML = """\
   <span id="vnc-clients"></span>
   <span>Port: <span id="kvm-port-display">—</span></span>
 </div>
+
+<div class="kvm-banner" id="kvm-banner"></div>
 
 <div class="grid-2">
 
@@ -635,6 +643,17 @@ async function refreshStatus() {
       (vs.refresh_rate ? ' @' + vs.refresh_rate + 'Hz' : '');
     document.getElementById('vnc-clients').textContent =
       (s.vnc_clients || 0) + ' VNC client' + (s.vnc_clients !== 1 ? 's' : '');
+
+    // KVM status banner
+    const banner = document.getElementById('kvm-banner');
+    if (banner) {
+      if (s.server_message) {
+        banner.textContent = s.server_message;
+        banner.className = 'kvm-banner visible';
+      } else {
+        banner.className = 'kvm-banner';
+      }
+    }
 
     const portEl = document.getElementById('kvm-port-display');
     if (portEl) portEl.textContent = s.kvm_port != null ? s.kvm_port : '—';
