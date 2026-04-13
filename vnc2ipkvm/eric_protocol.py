@@ -83,6 +83,27 @@ class KVMConfig:
     norbox_ipv6_target: str = ""    # IPv6 target for NORBOX routing
 
 
+class TilePredictor:
+    """Per-tile predictor cache for extended encoding gradient path.
+
+    Matches Java class `p` — stores 8 slots of tile_size^2 bytes each.
+    Used by the extended encoding (type 9) gradient filter to maintain
+    per-tile pixel state across updates.
+    """
+    __slots__ = ('slots',)
+
+    def __init__(self, num_slots: int = 8, slot_size: int = 256):
+        self.slots = [bytearray(slot_size) for _ in range(num_slots)]
+
+    def read_to(self, slot: int, src_off: int, length: int, dst: bytearray, dst_off: int):
+        """Copy FROM cache slot TO destination buffer (Java cfr_renamed_1)."""
+        dst[dst_off:dst_off + length] = self.slots[slot][src_off:src_off + length]
+
+    def write_from(self, slot: int, dst_off: int, length: int, src: bytearray, src_off: int):
+        """Copy FROM source buffer TO cache slot (Java a)."""
+        self.slots[slot][dst_off:dst_off + length] = src[src_off:src_off + length]
+
+
 class ERICProtocol:
     """Client for the e-RIC RFB protocol used by Belkin IP-KVM devices."""
 
@@ -100,6 +121,13 @@ class ERICProtocol:
         self.bpp = 8             # bits per pixel reported by server
         self.bytes_per_pixel = 1 # bpp / 8
         self._inflaters: list[zlib.decompressobj | None] = [None] * 4
+        # Tile predictor cache for extended encoding (type 9).
+        # Initialized on first framebuffer params read. Array of TilePredictor
+        # objects, one per 16x16 tile on screen.
+        self._tile_predictors: list | None = None
+        # Pixel buffer for extended encoding gradient path (Java: this.ai)
+        self._ext_pixel_buf = bytearray(65536)
+        self._ext_scratch_buf = bytearray(65536)
         self._running = False
         self._write_lock = asyncio.Lock()
         # Colour map: maps 8-bit pixel values to (R8, G8, B8) tuples.
@@ -246,29 +274,29 @@ class ERICProtocol:
         logger.info("Server protocol version: %d.%02d",
                      self.server_version_major, self.server_version_minor)
 
-        # 3. Read padding byte + server name
-        # The Java client reads two bytes before the name string:
-        #   ap.cfr_renamed_7() reads 1 byte, then l() internally reads
-        #   another padding byte before readUTF (2-byte length + string).
-        await self._read_byte()  # padding (ap.cfr_renamed_7, line 261)
-        await self._read_byte()  # padding (inside l(), before readUTF)
+        # 3. Read padding + server name (Java lines 261-262)
+        # cfr_renamed_7() reads 1 padding byte, then l() reads 1 more
+        # padding byte + readUTF (2-byte length + string data).
+        await self._read_byte()  # padding (cfr_renamed_7, line 261)
+        await self._read_byte()  # padding (l() → cfr_renamed_10, line 405)
         self.server_name = await self._read_string()
         logger.info("Server name: %s", self.server_name)
 
-        # 4. Read padding byte + server info block
-        await self._read_byte()  # padding
+        # 4. Read padding + server info (Java lines 263-264)
+        # cfr_renamed_7() reads 1 padding byte, then i() reads the info block.
+        await self._read_byte()  # padding (cfr_renamed_7, line 263)
         info = await self._read_server_info()
 
-        # 5. Send client protocol version
+        # 5. Send client protocol version (Java cfr_renamed_11, line 265)
         ver_str = f"e-RIC RFB {self.config.protocol_version}\n"
         await self._write(ver_str.encode("iso-8859-1"))
 
-        # 6. Send share desktop / port ID
+        # 6. Send share desktop / port ID (Java cfr_renamed_9, line 266)
         share_byte = 1 if self.config.share_desktop else 0
         await self._write(bytes([share_byte, self.config.port_id & 0xFF]))
 
-        # 7. Read padding byte + framebuffer parameters
-        await self._read_byte()  # padding (ap.cfr_renamed_7, line 267)
+        # 7. Read padding + framebuffer params (Java lines 267-268)
+        await self._read_byte()  # padding (cfr_renamed_7, line 267)
         await self._read_fb_params()
 
     async def _read_string(self) -> str:
@@ -317,6 +345,11 @@ class ERICProtocol:
                      red_shift, green_shift, blue_shift)
 
         self.fb.resize(self.width, self.height)
+
+        # Initialize tile predictor cache for extended encoding
+        # (Java ByteColorRFBRenderer.cfr_renamed_5, lines 754-759)
+        num_tiles = (self.width // 16) * (self.height // 16)
+        self._tile_predictors = [TilePredictor(8, 16 * 16) for _ in range(num_tiles)]
 
     # ---- Client -> Server messages ----
 
@@ -786,8 +819,15 @@ class ERICProtocol:
 
         self.fb.put_raw(x, y, cw, ch, bytes(result))
 
-    async def _decode_tight_common(self, x: int, y: int, w: int, h: int):
-        """Common tight encoding decoder used by both tight variants."""
+    async def _decode_tight_common(self, x: int, y: int, w: int, h: int,
+                                   tile_data=None, tile_mode_flags=0,
+                                   tile_size=16, tile_ppb=1):
+        """Common tight encoding decoder used by both tight variants.
+
+        When called from _decode_extended with tile_data, applies the tile
+        gradient filter after decompressing pixel data (Java: cfr_renamed_1
+        called from a() at line 471).
+        """
         # Read control byte
         control = await self._read_byte()
 
@@ -894,6 +934,15 @@ class ERICProtocol:
         # where predicted = left + above - above_left, clamped to [0, 255]
         if use_gradient:
             pixel_data = self._apply_gradient(pixel_data, w, h, row_bytes)
+
+        # Apply tile-level gradient if called from extended encoding
+        # (Java a() lines 470-473: cfr_renamed_1 called when byArray != null)
+        if tile_data is not None and tile_mode_flags != 0:
+            # Copy pixel data into ext buffer, apply gradient, copy back
+            self._ext_pixel_buf[:len(pixel_data)] = pixel_data
+            self._apply_tile_gradient(x, y, w, h, tile_data, tile_mode_flags,
+                                      tile_size, tile_ppb)
+            pixel_data = bytes(self._ext_pixel_buf[:len(pixel_data)])
 
         # Decode into framebuffer
         if palette_colors is not None:
@@ -1089,42 +1138,151 @@ class ERICProtocol:
             src += row_bytes
             self.fb.put_raw(x, y + j, w, 1, bytes(row[:w * bpp]))
 
+    def _apply_tile_gradient(self, x, y, w, h, tile_data, mode_flags,
+                             tile_size, pixels_per_byte):
+        """Apply tile-level gradient filter using predictor cache.
+
+        Matches Java ByteColorRFBRenderer.cfr_renamed_1() (lines 487-538).
+        Three branches based on mode_flags:
+          0: read from cache into pixel buffer (output only)
+          4: write from pixel buffer into cache (store only)
+          8: read+write with scratch buffer (bidirectional)
+        """
+        TILE = tile_size
+        ppb = pixels_per_byte  # pixels per byte (sub-block size)
+        tiles_w = self.width // TILE
+
+        # Aligned row range (Java lines 489-490)
+        y_start = ((y // TILE + 1) * TILE - y) if y % TILE else 0
+        y_end = ((y + h) // TILE) * TILE - y if (y + h) % TILE else h
+
+        ai = self._ext_pixel_buf
+        scratch = self._ext_scratch_buf
+
+        if mode_flags == 8:
+            # Branch 1 (Java lines 491-516): bidirectional — write new data
+            # to cache, read predictions from cache into scratch buffer
+            src_idx = 0
+            if y_start != 0:
+                scratch[:y_start * w // ppb] = ai[:y_start * w // ppb]
+                src_idx += y_start * w // ppb
+
+            for ty in range(y_start, y_end, TILE):
+                for row_in_tile in range(TILE):
+                    for tx in range(0, w, TILE):
+                        tile_idx = (y + ty) // TILE * tiles_w + (x + tx) // TILE
+                        ctrl = tile_data[ty // TILE * (w // TILE) + tx // TILE]
+                        slot = ctrl & 0x7F
+                        if tile_idx < len(self._tile_predictors):
+                            pred = self._tile_predictors[tile_idx]
+                            if (ctrl & 0x80) == 0:
+                                # Write current data into cache
+                                pred.write_from(slot, row_in_tile * (TILE // ppb),
+                                                TILE // ppb, ai, src_idx)
+                                src_idx += TILE // ppb
+                            # Read prediction from cache into scratch
+                            pred.read_to(slot, row_in_tile * (TILE // ppb),
+                                         TILE // ppb, scratch,
+                                         ((ty + row_in_tile) * w + tx) // ppb)
+
+            if y_end != h:
+                remaining = (h - y_end) * w // ppb
+                scratch[y_end * w // ppb:y_end * w // ppb + remaining] = \
+                    ai[src_idx:src_idx + remaining]
+                src_idx += remaining
+
+            ai[:w * h // ppb] = scratch[:w * h // ppb]
+
+        elif mode_flags == 4:
+            # Branch 2 (Java lines 517-526): write only — store into cache
+            for ty in range(y_start, y_end, TILE):
+                for tx in range(0, w, TILE):
+                    tile_idx = (y + ty) // TILE * tiles_w + (x + tx) // TILE
+                    slot = tile_data[ty // TILE * (w // TILE) + tx // TILE] & 0x7F
+                    if tile_idx < len(self._tile_predictors):
+                        pred = self._tile_predictors[tile_idx]
+                        for row_in_tile in range(TILE):
+                            pred.write_from(slot, row_in_tile * (TILE // ppb),
+                                            TILE // ppb, ai,
+                                            ((ty + row_in_tile) * w + tx) // ppb)
+
+        else:
+            # Branch 3 (Java lines 527-537, mode_flags=0): read only —
+            # copy from cache into pixel buffer
+            for ty in range(0, h, TILE):
+                for tx in range(0, w, TILE):
+                    tile_idx = (y + ty) // TILE * tiles_w + (x + tx) // TILE
+                    slot = tile_data[ty // TILE * (w // TILE) + tx // TILE] & 0x7F
+                    if tile_idx < len(self._tile_predictors):
+                        pred = self._tile_predictors[tile_idx]
+                        for row_in_tile in range(TILE):
+                            pred.read_to(slot, row_in_tile * (TILE // ppb),
+                                         TILE // ppb, ai,
+                                         ((ty + row_in_tile) * w + tx) // ppb)
+
     async def _decode_extended(self, x: int, y: int, w: int, h: int):
         """Decode Extended encoding (type 9).
 
-        This is a complex encoding with tile-level compression control.
-        We handle the basics; fall back to raw-like decoding for edge cases.
+        Two-level structure (Java ByteColorRFBRenderer.cfr_renamed_7):
+        Level 1: outer control byte → tile grid data
+        Level 2: either gradient+pixel decode (mode_flags==0) or
+                 full inner tight decoder (mode_flags!=0).
+
+        Outer control byte:
+          bits 0-3: sub_enc (1=1bit, 2=2bit, 3/4=4bit, 8=raw)
+          bits 4-5: stream index for tile data zlib
+          bits 6-7: mode flags (0 = gradient path, !0 = inner tight path)
         """
         control = await self._read_byte()
         stream_idx = (control >> 4) & 0x03
+        mode_flags = (control >> 4) & 0x0C  # bits 6-7 in original position
         sub_enc = control & 0x0F
         tile_size = 16
 
-        # Determine compression parameters
-        match sub_enc:
-            case 1: pixels_per_byte = 8
-            case 2: pixels_per_byte = 4
-            case 3 | 4: pixels_per_byte = 2
-            case 8: pixels_per_byte = 1
-            case _: return  # unsupported
-
-        # Calculate aligned tile rows
-        y_aligned_end = ((y + h) // tile_size) * tile_size - y if (y + h) % tile_size else h
-        num_tile_entries = (w // tile_size) * (y_aligned_end // tile_size)
-
-        # Read tile control data
-        if num_tile_entries > 0:
-            if num_tile_entries < 12:
-                tile_data = await self._read_exactly(num_tile_entries)
-            else:
-                zlib_len = await self._read_compact_len()
-                zlib_data = await self._read_exactly(zlib_len)
-                tile_data = self._inflate(stream_idx, zlib_data, num_tile_entries)
+        # Map sub-encoding to display mode and pixels_per_byte (Java lines 253-282)
+        if sub_enc == 1:
+            ppb, display_mode = 8, 10
+        elif sub_enc == 2:
+            ppb, display_mode = 4, 11
+        elif sub_enc == 3:
+            ppb, display_mode = 2, 12
+        elif sub_enc == 4:
+            ppb, display_mode = 2, 13
+        elif sub_enc == 8:
+            ppb, display_mode = 1, 0
         else:
-            tile_data = b''
+            return  # unknown sub-encoding
 
-        # Now decode the actual pixel data using the tight common path
-        await self._decode_tight_common(x, y, w, h)
+        # Calculate tile data size (Java lines 288-289)
+        aligned_h = ((y + h) // tile_size) * tile_size - y if (y + h) % tile_size else h
+        num_tile_entries = (w // tile_size) * (aligned_h // tile_size)
+
+        # Read tile control data (Java lines 290-308)
+        if num_tile_entries < 12:
+            tile_data = await self._read_exactly(num_tile_entries)
+        else:
+            zlib_len = await self._read_compact_len()
+            zlib_data = await self._read_exactly(zlib_len)
+            tile_data = self._inflate(stream_idx, zlib_data, num_tile_entries)
+
+        # Java lines 309-318: two code paths based on mode_flags
+        if mode_flags == 0:
+            # Gradient path: apply predictor cache then pixel decode.
+            # No additional data is read from the stream.
+            self._apply_tile_gradient(x, y, w, h, tile_data, mode_flags,
+                                      tile_size, ppb)
+            # Decode pixels from _ext_pixel_buf (populated by cache read)
+            pixel_data = bytes(self._ext_pixel_buf[:w * h // ppb])
+            self._decode_tight_pixels(x, y, w, h, pixel_data, display_mode,
+                                      w)  # row_bytes = w (1 byte per pixel)
+        else:
+            # Inner tight path: reads another control byte + pixel data.
+            # After decompression, apply tile gradient to cache the data.
+            await self._decode_tight_common(x, y, w, h,
+                                            tile_data=tile_data,
+                                            tile_mode_flags=mode_flags,
+                                            tile_size=tile_size,
+                                            tile_ppb=ppb)
 
     # ---- Other message handlers ----
 
