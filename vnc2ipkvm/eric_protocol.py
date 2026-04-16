@@ -1301,39 +1301,36 @@ class ERICProtocol:
     async def _handle_set_colourmap(self):
         """Handle SetColourMapEntries (type 0x01): update the colour map.
 
-        Standard RFB format: 1 padding + 2 first-colour + 2 num-colours,
-        then num-colours * 6 bytes (uint16 R, G, B each).
-
-        NOTE: The Java client throws on msg type 1 — it never reads this
-        message. The e-RIC format may differ from standard RFB. We log
-        the raw header bytes to verify the format.
+        The Java client throws on this message type (x.java line 254:
+        "Can't handle SetColourMapEntries message"), meaning the KVM
+        should never send it during normal operation. We handle it
+        using the standard RFB format (1 padding + 2 first-colour +
+        2 num-colours + N*6 colour bytes) to keep the stream aligned
+        if it does appear, but log a warning since the format is
+        unverified against actual KVM traffic.
         """
-        # Read the 5-byte header and log raw values for diagnostics
+        logger.warning("SetColourMapEntries received — Java client throws "
+                        "on this message type, format may not match e-RIC")
+
+        # Standard RFB format: 1 padding + 2 first + 2 count
         header = await self._read_exactly(5)
-        padding = header[0]
         first_colour = (header[1] << 8) | header[2]
         num_colours = (header[3] << 8) | header[4]
         body_len = num_colours * 6
 
-        logger.debug("SetColourMapEntries: first=%d count=%d",
-                     first_colour, num_colours)
+        logger.debug("SetColourMapEntries: first=%d count=%d", first_colour, num_colours)
 
-        # Sanity check — if values look wrong, the format may differ
+        # Sanity check
         if num_colours > 256 or first_colour > 255:
-            logger.warning("SetColourMapEntries: suspicious values "
-                           "first=%d count=%d — possible format mismatch, "
-                           "next bytes: %s",
-                           first_colour, num_colours,
-                           (await self._read_exactly(min(16, body_len))).hex(' ')
-                           if body_len > 0 else "")
+            logger.error("SetColourMapEntries: suspicious values "
+                         "first=%d count=%d — likely stream desync",
+                         first_colour, num_colours)
             return
 
         data = await self._read_exactly(body_len)
 
-        # In 16-bit mode, the server shouldn't send colourmap entries
-        # but we still read the data above to keep the stream aligned.
+        # In 16-bit mode, don't apply (no colour map used)
         if self.config.bpp == 16:
-            logger.debug("Ignoring SetColourMapEntries in 16-bit mode")
             return
 
         # Update the colour map with the new entries
@@ -1347,7 +1344,7 @@ class ERICProtocol:
             if idx < 256:
                 self._colourmap[idx] = (r, g, b)
 
-        # Apply the colour map to the framebuffer rendering.
+        # Apply to framebuffer
         colourmap_changed = self._colourmap != self.fb._colourmap
         if colourmap_changed or not self._colourmap_applied:
             self.fb.set_colourmap(self._colourmap)
