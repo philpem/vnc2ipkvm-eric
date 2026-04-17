@@ -55,6 +55,15 @@ class VNCServer:
             self._handle_client, self.listen_host, self.listen_port)
         addr = self._server.sockets[0].getsockname()
         logger.info("VNC server listening on %s:%d", addr[0], addr[1])
+        # Register for dirty-region broadcasts so each client gets its own
+        # copy of the dirty bounding box (prevents "dirty steal" when
+        # multiple VNC clients are connected simultaneously).
+        self.fb.on_dirty = self._on_fb_dirty
+
+    def _on_fb_dirty(self, x: int, y: int, w: int, h: int):
+        """Called by Framebuffer._mark_dirty (under fb.lock)."""
+        for client in self._clients:
+            client.expand_dirty(x, y, w, h)
 
     async def stop(self):
         if self._server:
@@ -127,6 +136,13 @@ class VNCClientHandler:
         self._pending_clipboard: str | None = None
         self._modifier_tracker = ModifierTracker()
         self._supports_desktop_size = False
+
+        # Per-client dirty tracking (independent of the shared fb dirty state)
+        self._dirty = False
+        self._dirty_x1 = self.fb.width
+        self._dirty_y1 = self.fb.height
+        self._dirty_x2 = 0
+        self._dirty_y2 = 0
 
         # Client pixel format (default 32-bit BGRX)
         self.bpp = 32
@@ -348,9 +364,11 @@ class VNCClientHandler:
 
                 if self._full_update:
                     self._full_update = False
-                    region = self.fb.get_full_region()
+                    # Clear per-client dirty state (full update covers it)
+                    self._get_client_dirty_region()
+                    region = (0, 0, self.fb.width, self.fb.height)
                 else:
-                    region = self.fb.get_dirty_region()
+                    region = self._get_client_dirty_region()
 
                 if region is None:
                     # No changes - send empty update
@@ -419,9 +437,16 @@ class VNCClientHandler:
                         pixel16 = (self.fb.pixels[src_off] << 8) | self.fb.pixels[src_off + 1]
                         r, g, b = RGB565_TO_RGB[pixel16]
                         src_off += 2
-                    pixel = ((r & self.red_max) << self.red_shift |
-                             (g & self.green_max) << self.green_shift |
-                             (b & self.blue_max) << self.blue_shift)
+                    # Scale 8-bit components down to the client's max ranges.
+                    # (r * max + 127) // 255 rounds to the nearest representable
+                    # value; bitwise AND would discard high bits and produce
+                    # severely wrong colours for any non-255 max.
+                    rs = (r * self.red_max + 127) // 255
+                    gs = (g * self.green_max + 127) // 255
+                    bs = (b * self.blue_max + 127) // 255
+                    pixel = ((rs << self.red_shift) |
+                             (gs << self.green_shift) |
+                             (bs << self.blue_shift))
                     if self.big_endian:
                         for i in range(out_bpp - 1, -1, -1):
                             result[dst + i] = pixel & 0xFF
@@ -434,6 +459,27 @@ class VNCClientHandler:
 
         return bytes(result)
 
+    def expand_dirty(self, x: int, y: int, w: int, h: int):
+        """Expand this client's dirty bounding box (called from fb callback)."""
+        self._dirty = True
+        self._dirty_x1 = min(self._dirty_x1, x)
+        self._dirty_y1 = min(self._dirty_y1, y)
+        self._dirty_x2 = max(self._dirty_x2, x + w)
+        self._dirty_y2 = max(self._dirty_y2, y + h)
+
+    def _get_client_dirty_region(self):
+        """Return and clear this client's dirty bounding box."""
+        if not self._dirty:
+            return None
+        x1, y1 = self._dirty_x1, self._dirty_y1
+        x2, y2 = self._dirty_x2, self._dirty_y2
+        self._dirty = False
+        self._dirty_x1 = self.fb.width
+        self._dirty_y1 = self.fb.height
+        self._dirty_x2 = 0
+        self._dirty_y2 = 0
+        return (x1, y1, x2 - x1, y2 - y1)
+
     def queue_bell(self):
         self._pending_bell = True
         self._update_requested.set()
@@ -441,6 +487,8 @@ class VNCClientHandler:
     def queue_resize(self):
         self._pending_resize = True
         self._full_update = True
+        # Mark entire screen dirty so the resize triggers a full repaint
+        self.expand_dirty(0, 0, self.fb.width, self.fb.height)
         self._update_requested.set()
 
     def queue_clipboard(self, text: str):

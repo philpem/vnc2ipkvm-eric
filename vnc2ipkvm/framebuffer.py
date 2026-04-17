@@ -22,12 +22,18 @@ class Framebuffer:
         # Only used when bytes_per_pixel == 1
         self._colourmap: list[tuple[int, int, int]] = list(RGB332_TO_RGB)
 
-        # Dirty tracking
+        # Dirty tracking (used by single-consumer code paths)
         self._dirty = False
         self._dirty_x1 = width
         self._dirty_y1 = height
         self._dirty_x2 = 0
         self._dirty_y2 = 0
+
+        # Optional callback: on_dirty(x, y, w, h) — called (under lock)
+        # whenever a region is marked dirty. Used by the VNC server to
+        # push per-client dirty tracking so multiple clients don't steal
+        # each other's dirty regions.
+        self.on_dirty = None
 
     def set_colourmap(self, colourmap: list[tuple[int, int, int]]):
         """Update the colour map used for 8-bit pixel conversion."""
@@ -208,6 +214,8 @@ class Framebuffer:
         self._dirty_y1 = min(self._dirty_y1, y)
         self._dirty_x2 = max(self._dirty_x2, x + w)
         self._dirty_y2 = max(self._dirty_y2, y + h)
+        if self.on_dirty:
+            self.on_dirty(x, y, w, h)
 
     def _mark_all_dirty(self):
         self._dirty = True

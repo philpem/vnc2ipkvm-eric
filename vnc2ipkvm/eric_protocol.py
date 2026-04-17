@@ -838,21 +838,29 @@ class ERICProtocol:
 
         sub_enc = (control >> 4) & 0x0F
 
-        # Solid fill
+        # Solid fill (sub_enc=8). Java reads 1 byte (colormap index) but
+        # that is hardcoded for its 8-bit-only mode. In 16-bit mode the
+        # KVM sends a native 2-byte RGB565 pixel, which is what
+        # _read_pixel returns. (Verified empirically: this is what the
+        # previous working test did.)
         if sub_enc == 0x08:
             color = await self._read_pixel()
             self.fb.fill_rect(x, y, w, h, color)
             return
 
-        # Palette fill
+        # Palette fill (sub_enc=15). Java line 350-368: read 1 byte
+        # palette_type; if type is 1-4, read 1 more byte (palette index).
+        # For any other type, NO extra byte is read (color defaults to 0).
+        # Reading 2 bytes unconditionally (as we did) over-reads by 1
+        # byte for unknown palette types and desyncs the stream.
         if sub_enc == 0x0F:
             palette_type = await self._read_byte()
-            color_byte = await self._read_byte()
             palette = self._get_tight_palette(palette_type)
-            if palette:
+            if palette is not None:
+                color_byte = await self._read_byte()
                 color_val = palette[color_byte % len(palette)]
             else:
-                color_val = color_byte
+                color_val = 0
             self.fb.fill_rect(x, y, w, h, self._argb_to_native(color_val))
             return
 
@@ -930,9 +938,16 @@ class ERICProtocol:
             zlib_data = await self._read_exactly(zlib_len)
             pixel_data = self._inflate(stream_idx, zlib_data, data_len)
 
-        # Apply gradient filter: each byte = (delta + predicted) & 0xFF
-        # where predicted = left + above - above_left, clamped to [0, 255]
+        # Apply gradient filter (filter type 2). Java rejects this filter,
+        # so the KVM does not send it in 8-bit mode, but DOES send it in
+        # 16-bit mode (Java doesn't use 16-bit, so the wire format here
+        # is undocumented). The per-byte gradient is structurally wrong
+        # for 16-bit RGB565 (components straddle byte boundaries) but
+        # produces visually-degraded output rather than crashes — leave
+        # in place until the per-component variant is verified safe.
         if use_gradient:
+            logger.debug("    tight gradient filter on %dx%d (%d bpp)",
+                         w, h, self.bytes_per_pixel)
             pixel_data = self._apply_gradient(pixel_data, w, h, row_bytes)
 
         # Apply tile-level gradient if called from extended encoding
@@ -964,6 +979,9 @@ class ERICProtocol:
 
         Each byte is a delta: actual = (delta + predicted) & 0xFF
         where predicted = clamp(left + above - above_left, 0, 255).
+
+        Correct only when each byte is an independent value (e.g. 8-bit
+        RGB332). For multi-byte pixel formats, use a per-component variant.
         """
         result = bytearray(len(data))
         prev_row = bytearray(row_bytes)
@@ -977,6 +995,54 @@ class ERICProtocol:
                 predicted = max(0, min(255, left + above - above_left))
                 result[src + i] = (data[src + i] + predicted) & 0xFF
             prev_row[:] = result[src:src + row_bytes]
+
+        return bytes(result)
+
+    @staticmethod
+    def _apply_gradient_rgb565(data: bytes, w: int, h: int) -> bytes:
+        """Apply tight gradient filter to big-endian RGB565 pixel data.
+
+        Operates per-component: each pixel's R5/G6/B5 is predicted from
+        the same component of the left/above/above-left pixels and the
+        delta in the wire data is added per-component (mod 32 / 64 / 32).
+        Per-byte gradient is wrong for RGB565 because the G component
+        straddles byte boundaries.
+        """
+        n = w * h
+        if len(data) < n * 2:
+            return bytes(data)  # short data: leave as-is rather than crash
+        result = bytearray(n * 2)
+        # Previous row's components, indexed by column
+        prev_r = [0] * w
+        prev_g = [0] * w
+        prev_b = [0] * w
+
+        for j in range(h):
+            cur_left_r = cur_left_g = cur_left_b = 0
+            above_left_r = above_left_g = above_left_b = 0
+            base = j * w * 2
+            for i in range(w):
+                src = base + i * 2
+                d = (data[src] << 8) | data[src + 1]
+                d_r = (d >> 11) & 0x1F
+                d_g = (d >> 5) & 0x3F
+                d_b = d & 0x1F
+
+                ar, ag, ab = prev_r[i], prev_g[i], prev_b[i]
+                pr = max(0, min(31, cur_left_r + ar - above_left_r))
+                pg = max(0, min(63, cur_left_g + ag - above_left_g))
+                pb = max(0, min(31, cur_left_b + ab - above_left_b))
+
+                nr = (d_r + pr) & 0x1F
+                ng = (d_g + pg) & 0x3F
+                nb = (d_b + pb) & 0x1F
+                p = (nr << 11) | (ng << 5) | nb
+                result[src] = (p >> 8) & 0xFF
+                result[src + 1] = p & 0xFF
+
+                cur_left_r, cur_left_g, cur_left_b = nr, ng, nb
+                above_left_r, above_left_g, above_left_b = ar, ag, ab
+                prev_r[i], prev_g[i], prev_b[i] = nr, ng, nb
 
         return bytes(result)
 
@@ -1024,13 +1090,24 @@ class ERICProtocol:
 
         Streams are reset via the tight control byte's low 4 bits, which
         the caller handles by setting _inflaters[i] = None before calling.
+
+        Never call decompressobj.flush() — it permanently finalises the
+        stream and breaks all subsequent decompress() calls. If decompress()
+        returns fewer bytes than expected, drain the internal buffer with
+        empty-input calls until expected_len is reached or no more output
+        is produced.
         """
         if self._inflaters[stream_idx] is None:
             self._inflaters[stream_idx] = zlib.decompressobj()
-        result = self._inflaters[stream_idx].decompress(data, expected_len)
-        if len(result) < expected_len:
-            # May need more data from the stream
-            result += self._inflaters[stream_idx].flush()
+        d = self._inflaters[stream_idx]
+        result = d.decompress(data, expected_len)
+        while len(result) < expected_len:
+            # Pull any output buffered inside zlib without giving it new input
+            # and without finalising the stream.
+            chunk = d.decompress(b"", expected_len - len(result))
+            if not chunk:
+                break
+            result += chunk
         return result[:expected_len]
 
     def _put_pixel_row(self, row: bytearray, px: int, color: int):
@@ -1271,7 +1348,11 @@ class ERICProtocol:
             # No additional data is read from the stream.
             self._apply_tile_gradient(x, y, w, h, tile_data, mode_flags,
                                       tile_size, ppb)
-            # Decode pixels from _ext_pixel_buf (populated by cache read)
+            # Decode pixels from _ext_pixel_buf (populated by cache read).
+            # NOTE: row_bytes is wrong here for packed display modes
+            # (10/11/12/13) and for 16-bit raw — see TODO. Confirmed not
+            # the cause of the user-visible wire desync, so leave alone
+            # until extended-encoding-in-16-bit is fully verified.
             pixel_data = bytes(self._ext_pixel_buf[:w * h // ppb])
             self._decode_tight_pixels(x, y, w, h, pixel_data, display_mode,
                                       w)  # row_bytes = w (1 byte per pixel)
@@ -1320,14 +1401,17 @@ class ERICProtocol:
 
         logger.debug("SetColourMapEntries: first=%d count=%d", first_colour, num_colours)
 
+        # Always consume the body bytes BEFORE any sanity-check bailout —
+        # otherwise the stream is left misaligned and the next message read
+        # interprets colour data as a message type, killing the session.
+        data = await self._read_exactly(body_len)
+
         # Sanity check
         if num_colours > 256 or first_colour > 255:
             logger.error("SetColourMapEntries: suspicious values "
-                         "first=%d count=%d — likely stream desync",
-                         first_colour, num_colours)
+                         "first=%d count=%d — discarding %d body bytes",
+                         first_colour, num_colours, body_len)
             return
-
-        data = await self._read_exactly(body_len)
 
         # In 16-bit mode, don't apply (no colour map used)
         if self.config.bpp == 16:
