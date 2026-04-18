@@ -8,27 +8,90 @@ legacy browser.
 ```
 [VNC Client] <--standard RFB 3.8--> [vnc2ipkvm] <--e-RIC RFB--> [Belkin IP-KVM]
                                          |
-                                    HTTP Control API
-                                    (video, power, KVM port, ...)
+                                    HTTP Control API + noVNC
+                                    (video, KVM port, hotkeys, ...)
 ```
 
 ## Requirements
 
 - Python 3.10+
-- No external dependencies (uses only the standard library)
+- `websockets` library (for the browser-based noVNC viewer)
+
+```bash
+pip install websockets
+```
+
+The core VNC bridge works without `websockets` — only the noVNC browser
+viewer requires it.
 
 ## Quick Start
 
 ```bash
+# Auto-login with username/password (recommended)
+python -m vnc2ipkvm --host 192.168.1.100 --user admin --password pass -v
+
+# Or provide a session ID manually
 python -m vnc2ipkvm --host 192.168.1.100 --applet-id ABC123 -v
 ```
 
-Then connect any VNC client (TigerVNC, RealVNC, TightVNC, etc.) to
-`localhost:5900`.
+Then connect any VNC client (TigerVNC, RealVNC, etc.) to `localhost:5900`,
+or open **http://localhost:6900/** in a browser for the built-in noVNC
+viewer and control panel.
 
-The **Applet ID** is the session token from the KVM's web interface. Log
-into the KVM's web UI, open the remote console page, and find the
-`APPLET_ID` or `SRV_ID` parameter in the applet tag or URL.
+When using `--user`/`--password`, the session token is fetched
+automatically from the KVM's web interface and refreshed on reconnect.
+When using `--applet-id`, you must extract the session token manually
+from the KVM's web UI (look for `APPLET_ID` in the applet page source),
+and auto-reconnect will not be able to refresh expired sessions.
+
+## Pixel Format and Encodings
+
+### Pixel depth (`--bpp`)
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| **16-bit** (default) | `--bpp 16` | Native RGB565. Best colour fidelity. The KVM captures in 16-bit internally, so this avoids a quantisation step. |
+| **8-bit** | `--bpp 8` | RGB332 with colour map. Lower bandwidth but visibly reduced colour depth (256 colours). Matches the original Java applet's mode. |
+
+### Encoding presets (`--encodings`)
+
+The encoding preset controls how the KVM compresses framebuffer updates.
+Use a named preset or a comma-separated list of encoding IDs.
+
+| Preset | Encodings | Description |
+|--------|-----------|-------------|
+| **`default`** | `255, 7, -250` | Hextile + tight. Best overall: hextile for incremental updates (cursor tracking, small changes), tight for larger regions. Recommended. |
+| `compressed` | `7, -252` | Tight only with higher compression. Slower but lower bandwidth. |
+| `corre` | `5` | Hextile only. Simple and reliable; no zlib state to manage. Good fallback if tight causes issues. |
+| `tight` | `7, -250, 9` | Tight + extended encoding. Adds the tile-predictor cache (encoding 9) for better compression of repeated patterns. Extended encoding has known issues in 16-bit mode. |
+
+```bash
+# Use the default preset (recommended)
+python -m vnc2ipkvm --host kvm.local --user admin --password pass
+
+# Hextile only (simplest, most reliable)
+python -m vnc2ipkvm --host kvm.local --user admin --password pass --encodings corre
+
+# Custom encoding list
+python -m vnc2ipkvm --host kvm.local --user admin --password pass --encodings 7,-250
+```
+
+### Choosing the right settings
+
+For most use cases, the defaults (`--bpp 16`, `--encodings default`) are
+best. The KVM will use hextile for small updates and tight for large
+regions, with native 16-bit colour.
+
+If you experience issues:
+- **Visual corruption in a horizontal band** near the top of the initial
+  screen load: this is the tight gradient filter (filter type 2), which
+  the KVM sends only in 16-bit mode. It should render correctly; if it
+  doesn't, try `--encodings corre` to avoid tight encoding entirely.
+- **Stream desync or hangs**: try `--encodings corre` (hextile only) or
+  `--bpp 8` to fall back to the mode the Java applet used.
+- **Extended encoding (9) issues**: the `tight` preset includes encoding
+  9 which has known wire-level desync in 16-bit mode. Avoid `--encodings
+  tight` with `--bpp 16` until this is resolved.
 
 ## Command-Line Options
 
@@ -39,13 +102,21 @@ Connection:
   --host HOST             KVM hostname or IP address (required)
   --port PORT             KVM TCP port (default: 443)
   --ssl-port PORT         KVM SSL port (default: same as --port)
-  --applet-id ID          Session/auth ID from KVM web interface (required)
+  --user USER             KVM web login username
+  --password PASS         KVM web login password
+  --http-port PORT        KVM web interface HTTP port (default: 80)
+  --applet-id ID          Session/auth ID (auto-fetched with --user/--password)
   --protocol-version VER  Protocol version string (default: 01.00)
   --port-id N             KVM port number (default: 0)
   --no-share              Request exclusive access (default: shared)
   --ssl / --no-ssl        Enable/disable SSL (default: SSL on)
   --norbox {no,ipv4,ipv6} NORBOX routing mode (default: no)
   --norbox-target ADDR    NORBOX target IP address
+
+Display:
+  --bpp {8,16}            Pixel depth (default: 16 = RGB565, 8 = RGB332)
+  --encodings PRESET      Encoding preset or comma-separated list
+                          Presets: default, compressed, corre, tight
 
 VNC Server:
   --vnc-host ADDR         VNC listen address (default: 0.0.0.0)
@@ -57,7 +128,6 @@ Control API:
 
 Input:
   --layout LAYOUT         Keyboard layout (default: en_US)
-  --encodings LIST        Comma-separated encoding list (default: 255,7,6)
 
 Other:
   --no-reconnect          Disable auto-reconnect to KVM
@@ -81,135 +151,71 @@ Other:
 ## Control API
 
 A lightweight HTTP API runs on port 6900 for KVM features that can't be
-sent over VNC (video settings, power control, KVM port switching, etc.).
+sent over VNC (video settings, KVM port switching, hotkeys, etc.).
 
-Open **http://localhost:6900/** in a browser for a web-based control panel
-with sliders and buttons. Or use `curl` from the command line:
+Open **http://localhost:6900/** in a browser for the web control panel,
+which includes:
 
-### Endpoints
+- **Embedded noVNC viewer** — browser-based VNC client (no install needed)
+- Live connection status with Server-Sent Events (SSE)
+- Video setting sliders (brightness, contrast, clock, phase, offsets)
+- KVM port switching for multi-server KVMs
+- Exclusive access toggle
+- Hotkey buttons (from KVM configuration, e.g. Ctrl+Alt+Delete)
+- Text typing and key expression input
+- RDP and Host Acceleration mode controls
 
-#### Status
-
-```bash
-# Current KVM status and video settings (JSON)
-curl http://localhost:6900/status
-
-# List all endpoints
-curl http://localhost:6900/help
-```
-
-Example `/status` response:
-
-```json
-{
-  "connected": true,
-  "server_name": "Belkin KVM",
-  "protocol_version": "3.08",
-  "framebuffer": {
-    "width": 1024,
-    "height": 768
-  },
-  "video_settings": {
-    "brightness": 128,
-    "contrast": 200,
-    "contrast_green": 200,
-    "contrast_blue": 200,
-    "clock": 2160,
-    "phase": 16,
-    "h_offset": 256,
-    "v_offset": 64,
-    "resolution": "1024x768",
-    "refresh_rate": 60
-  },
-  "keyboard_layout": "en_GB",
-  "vnc_clients": 1
-}
-```
-
-#### Video Settings
-
-Adjust the KVM's video capture parameters. These control the analog-to-digital
-conversion of the VGA signal from the managed server.
+### API Endpoints
 
 ```bash
-# Individual settings (each has a valid range)
-curl -X POST http://localhost:6900/video/brightness/128     # 0-255
-curl -X POST http://localhost:6900/video/contrast/200       # 0-255 (or contrast-red)
-curl -X POST http://localhost:6900/video/contrast-green/200 # 0-255
-curl -X POST http://localhost:6900/video/contrast-blue/200  # 0-255
-curl -X POST http://localhost:6900/video/clock/2160         # 0-4320
-curl -X POST http://localhost:6900/video/phase/16           # 0-31
-curl -X POST http://localhost:6900/video/h-offset/256       # 0-512
-curl -X POST http://localhost:6900/video/v-offset/64        # 0-128
+# Status
+curl http://localhost:6900/status        # JSON status and video settings
+curl http://localhost:6900/help          # List all endpoints
+GET  /events                            # SSE stream of status updates
 
-# Actions
-curl -X POST http://localhost:6900/video/auto-adjust  # auto-detect optimal settings
-curl -X POST http://localhost:6900/video/save          # save current settings to KVM
-curl -X POST http://localhost:6900/video/undo          # revert to saved settings
-curl -X POST http://localhost:6900/video/reset-mode    # reset current video mode
-curl -X POST http://localhost:6900/video/reset-all     # factory reset all video modes
-```
+# Video settings
+curl -X POST http://localhost:6900/video/brightness/80    # 0-127
+curl -X POST http://localhost:6900/video/contrast/200     # 0-255
+curl -X POST http://localhost:6900/video/auto-adjust
+curl -X POST http://localhost:6900/video/refresh          # Force full screen redraw
+curl -X POST http://localhost:6900/video/save
+curl -X POST http://localhost:6900/video/undo
+curl -X POST http://localhost:6900/video/reset-mode
+curl -X POST http://localhost:6900/video/reset-all
 
-#### KVM Port Switching
+# KVM port switching
+curl -X POST http://localhost:6900/kvm/port/1
 
-For multi-server KVMs, switch the active port:
-
-```bash
-curl -X POST http://localhost:6900/kvm/port/1   # switch to port 1
-curl -X POST http://localhost:6900/kvm/port/2   # switch to port 2
-```
-
-#### Exclusive Access
-
-Lock out other remote console users:
-
-```bash
+# Exclusive access
 curl -X POST http://localhost:6900/exclusive/on
 curl -X POST http://localhost:6900/exclusive/off
-```
 
-#### Keyboard
-
-```bash
-# Release all stuck modifier keys (useful if Ctrl/Alt/Shift get stuck)
+# Keyboard
 curl -X POST http://localhost:6900/keyboard/release-all
-
-# Type a string on the KVM (sends individual key press/release events)
 curl -X POST http://localhost:6900/keyboard/type -d 'Hello World'
+curl -X POST http://localhost:6900/keyboard/send -d 'Ctrl+Alt+Delete'
+curl -X POST http://localhost:6900/keyboard/send -d '36 37 4e f1'  # raw hex scan codes
+
+# Hotkeys (from KVM configuration)
+curl -X POST http://localhost:6900/hotkey/0
+
+# Modes
+curl -X POST http://localhost:6900/rdp/on            # Enter Remote Desktop mode
+curl -X POST http://localhost:6900/host-direct/on    # Enter Host Acceleration mode
+curl -X POST http://localhost:6900/mode/exit         # Exit current mode
 ```
 
-#### Power Control
+### noVNC Viewer
 
-```bash
-curl -X POST http://localhost:6900/power/0
-```
-
-### Web Control Panel
-
-Open **http://localhost:6900/** in any browser for a graphical control panel:
-
-- Live connection status, resolution, and refresh rate
-- Video setting sliders with real-time preview
-- Auto-adjust, save, undo, and factory reset buttons
-- KVM port switching
-- Exclusive access toggle
-- Text typing input
-- Key release button
-
-The panel auto-refreshes status every 3 seconds and sends slider changes
-with 150ms debouncing to avoid flooding the KVM.
+The built-in noVNC viewer is available at **http://localhost:6900/vnc**
+(or embedded in the main control panel). It connects via a WebSocket
+proxy running on port 6901 (control API port + 1).
 
 ### API Security
 
 By default the API listens on `127.0.0.1` (localhost only). To expose it
-on all interfaces:
-
-```bash
-python -m vnc2ipkvm --host ... --api-host 0.0.0.0
-```
-
-There is no authentication on the API. Use firewall rules if exposing
-it on a network.
+on all interfaces, use `--api-host 0.0.0.0`. There is no authentication
+on the API — use firewall rules if exposing it on a network.
 
 ## Architecture
 
@@ -219,32 +225,39 @@ vnc2ipkvm/
   __main__.py          python -m entry point
   main.py              CLI, Bridge class (wires KVM client <-> VNC server)
   eric_protocol.py     e-RIC RFB client (connect, auth, framebuffer, input)
-  vnc_server.py        Standard VNC/RFB 3.8 server
+  vnc_server.py        Standard VNC/RFB 3.8 server (per-client dirty tracking)
   control_api.py       HTTP control API + embedded web UI
-  framebuffer.py       Shared framebuffer with dirty tracking
+  websocket_proxy.py   WebSocket-to-TCP proxy for noVNC
+  framebuffer.py       Shared framebuffer with dirty-region broadcasting
   keyboard.py          Keysym-to-scancode translation (9 layouts)
-  color.py             RGB332 <-> RGB888 color conversion
+  color.py             RGB332/RGB565 <-> RGB888 color conversion tables
+  web_login.py         Auto-login to KVM web interface for session tokens
+  novnc/               Bundled noVNC v1.6.0 (MPL 2.0)
 ```
 
 ### Protocol Documentation
 
-See [PROTOCOL.md](../PROTOCOL.md) for a complete specification of the e-RIC
-RFB protocol reverse-engineered from the decompiled Java client.
+See [PROTOCOL.md](../PROTOCOL.md) for a specification of the e-RIC RFB
+protocol reverse-engineered from the decompiled Java client.
 
 ## Examples
 
 ```bash
-# Basic usage with UK keyboard
-python -m vnc2ipkvm --host 192.168.1.100 --applet-id ABC123 --layout en_GB -v
+# Auto-login with UK keyboard (most common usage)
+python -m vnc2ipkvm --host 192.168.1.100 --user admin --password pass \
+  --layout en_GB -v
 
-# Plain TCP (no SSL), custom VNC port
-python -m vnc2ipkvm --host 10.0.0.50 --no-ssl --port 80 --applet-id XYZ \
-  --vnc-port 5901 -v
+# Plain TCP (no SSL), hextile-only encoding
+python -m vnc2ipkvm --host 10.0.0.50 --no-ssl --user admin --password pass \
+  --encodings corre --vnc-port 5901 -v
 
-# Disable control API
+# 8-bit mode (matches original Java applet)
+python -m vnc2ipkvm --host kvm.local --user admin --password pass --bpp 8
+
+# Manual session ID, no control API
 python -m vnc2ipkvm --host kvm.local --applet-id ABC123 --api-port 0
 
 # With NORBOX routing
-python -m vnc2ipkvm --host proxy.local --applet-id ABC123 \
+python -m vnc2ipkvm --host proxy.local --user admin --password pass \
   --norbox ipv4 --norbox-target 192.168.1.100
 ```
