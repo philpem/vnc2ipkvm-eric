@@ -837,7 +837,6 @@ class ERICProtocol:
                 self._inflaters[i] = None
 
         sub_enc = (control >> 4) & 0x0F
-
         # Solid fill (sub_enc=8). Java reads 1 byte (colormap index) but
         # that is hardcoded for its 8-bit-only mode. In 16-bit mode the
         # KVM sends a native 2-byte RGB565 pixel, which is what
@@ -904,8 +903,21 @@ class ERICProtocol:
                         palette_colors[0] = PALETTE_16_COLOR[pb >> 4]
                         palette_colors[1] = PALETTE_16_COLOR[pb & 0xF]
                     else:
-                        palette_colors[0] = RGB332_TO_ARGB[await self._read_byte()]
-                        palette_colors[1] = RGB332_TO_ARGB[await self._read_byte()]
+                        # Default depth: read native-format pixel colours.
+                        # Java reads 1-byte RGB332 indices (8-bit only); in
+                        # 16-bit mode the KVM sends 2-byte RGB565 values —
+                        # same format as multi-color palette entries.
+                        c0 = await self._read_pixel()
+                        c1 = await self._read_pixel()
+                        if self.bytes_per_pixel == 1:
+                            palette_colors[0] = RGB332_TO_ARGB[c0 & 0xFF]
+                            palette_colors[1] = RGB332_TO_ARGB[c1 & 0xFF]
+                        else:
+                            from vnc2ipkvm.color import RGB565_TO_RGB
+                            r, g, b = RGB565_TO_RGB[c0]
+                            palette_colors[0] = 0xFF000000 | (r << 16) | (g << 8) | b
+                            r, g, b = RGB565_TO_RGB[c1]
+                            palette_colors[1] = 0xFF000000 | (r << 16) | (g << 8) | b
                     row_bytes = (w + 7) // 8
                 else:
                     # Multi-color palette: bytes_per_pixel bytes per colour
@@ -938,17 +950,17 @@ class ERICProtocol:
             zlib_data = await self._read_exactly(zlib_len)
             pixel_data = self._inflate(stream_idx, zlib_data, data_len)
 
-        # Apply gradient filter (filter type 2). Java rejects this filter,
-        # so the KVM does not send it in 8-bit mode, but DOES send it in
-        # 16-bit mode (Java doesn't use 16-bit, so the wire format here
-        # is undocumented). The per-byte gradient is structurally wrong
-        # for 16-bit RGB565 (components straddle byte boundaries) but
-        # produces visually-degraded output rather than crashes — leave
-        # in place until the per-component variant is verified safe.
+        # Apply gradient filter (filter type 2). Java rejects this filter
+        # (throws on filter_type != 0/1), so the KVM never sends it in
+        # 8-bit mode. In 16-bit mode the KVM does send it — the deltas
+        # are 2-byte RGB565 pixels and must be predicted per-component
+        # (R5/G6/B5) since the green component straddles the byte boundary.
         if use_gradient:
-            logger.debug("    tight gradient filter on %dx%d (%d bpp)",
-                         w, h, self.bytes_per_pixel)
-            pixel_data = self._apply_gradient(pixel_data, w, h, row_bytes)
+            logger.debug("    tight gradient filter on %dx%d (%d bpp)", w, h, self.bytes_per_pixel)
+            if self.bytes_per_pixel == 2:
+                pixel_data = self._apply_gradient_rgb565(pixel_data, w, h)
+            else:
+                pixel_data = self._apply_gradient(pixel_data, w, h, row_bytes)
 
         # Apply tile-level gradient if called from extended encoding
         # (Java a() lines 470-473: cfr_renamed_1 called when byArray != null)
