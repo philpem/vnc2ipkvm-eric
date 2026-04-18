@@ -1,16 +1,13 @@
 # vnc2ipkvm - VNC-to-IPKVM Protocol Translator
 
-A standalone bridge that connects to a Belkin IP-KVM device using its
-proprietary e-RIC RFB protocol, and exposes it as a standard VNC server.
-Any modern VNC client can then control the KVM without needing Java or a
-legacy browser.
+Phil Pemberton, 2026.
 
-```
-[VNC Client] <--standard RFB 3.8--> [vnc2ipkvm] <--e-RIC RFB--> [Belkin IP-KVM]
-                                         |
-                                    HTTP Control API + noVNC
-                                    (video, KVM port, hotkeys, ...)
-```
+`vnc2ipkvm` is a shim which translates from the VNC-based protocol used
+by Raritan e-RIC RFB IP-KVMs to the standard VNC protocol. Alongside VNC,
+a web interface is provided, which gives access to a web-based VNC client.
+
+There's no password on the VNC port or web interface, so don't use this on
+an insecure network...
 
 ## Requirements
 
@@ -237,7 +234,7 @@ vnc2ipkvm/
 
 ### Protocol Documentation
 
-See [PROTOCOL.md](../PROTOCOL.md) for a specification of the e-RIC RFB
+See [PROTOCOL.md](PROTOCOL.md) for a specification of the e-RIC RFB
 protocol reverse-engineered from the decompiled Java client.
 
 ## Examples
